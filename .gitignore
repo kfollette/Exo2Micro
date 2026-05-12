@@ -1,0 +1,68 @@
+# ─── Python ──────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Installer logs
+*.manifest
+*.spec
+
+#─── Files ────────────────────────────────────────────
+raw/*
+!raw/Read.me.txt
+processed/*
+
+# ─── Virtual environments ────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ─── Testing ─────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# ─── Sphinx documentation ────────────────────────────────────────────
+docs/build/
+docs/source/_build/
+
+# ─── Jupyter ─────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ─── exo2micro pipeline outputs ──────────────────────────────────────
+# The pipeline writes processed images and diagnostic plots to these
+# directories. They're regenerated from raw data and shouldn't be
+# committed.
+processed/
+raw/
+
+# ─── OS junk ─────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Editors and IDEs ────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ─── Type checkers ───────────────────────────────────────────────────
+.mypy_cache/
+.pyre/
+.pytype/

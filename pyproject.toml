@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "exo2micro"
+version = "2.3.0"
+description = "Image registration and fluorescence subtraction for pre/post-stain microscopy"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [
+    { name = "exo2micro contributors" },
+]
+dependencies = [
+    "numpy>=1.22",
+    "scipy>=1.8",
+    "opencv-python-headless>=4.5",
+    "matplotlib>=3.5",
+    "astropy>=5.0",
+    "tifffile>=2022.0",
+    "Pillow>=9.0",
+]
+
+[project.optional-dependencies]
+gui = ["ipywidgets>=8.0"]
+
+[tool.setuptools.packages.find]
+include = ["exo2micro*"]

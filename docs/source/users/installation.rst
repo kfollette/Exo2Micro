@@ -16,15 +16,10 @@ exo2micro is a Python package. You need:
 Getting the code
 ----------------
 
-.. todo::
-
-   Replace the placeholder URL below with the real repository URL once
-   published.
-
 .. code-block:: bash
 
-   git clone https://github.com/your-org/exo2micro.git
-   cd exo2micro
+   git clone https://github.com/kfollette/Exo2Micro.git
+   cd Exo2Micro
 
 Installing the dependencies
 ---------------------------

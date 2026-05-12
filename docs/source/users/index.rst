@@ -10,6 +10,7 @@ things don't look right.
 .. toctree::
    :maxdepth: 2
 
+   before_you_start
    installation
    quickstart
    gui_tour

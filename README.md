@@ -8,14 +8,31 @@ Version 2.3.
 
 ---
 
-## Installation
+## Before You Start
 
-<!-- TODO: replace placeholder URL with the real repository URL -->
+If you've never installed a Python package from GitHub before, the
+[Before You Start](https://exo2micro.readthedocs.io/en/latest/users/before_you_start.html)
+page walks you through everything you need on your computer first — opening
+a terminal on macOS or Windows, making a GitHub account, installing Python
+(via Miniforge), and getting JupyterLab running. **Start there if any of
+the following are true:**
+
+- You don't have a Python installation on your computer.
+- You don't have a GitHub account.
+- You've never opened a terminal (Terminal on Mac, Windows Terminal on PC).
+- You don't have JupyterLab or Jupyter Notebook installed.
+
+If all four are already set up, skip ahead to [Installation](#installation)
+below.
+
+---
+
+## Installation
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-org/exo2micro.git
-cd exo2micro
+git clone https://github.com/kfollette/Exo2Micro.git
+cd Exo2Micro
 
 # Install dependencies
 pip install numpy scipy opencv-python-headless matplotlib astropy tifffile Pillow ipywidgets
@@ -65,12 +82,26 @@ If a filename is wrong, the affected `(sample, dye)` task fails with a clear err
 
 ### Option 1: Interactive GUI (recommended for non-coders)
 
-Open `exo2micro_notebook.ipynb` in JupyterLab or Jupyter Notebook and run the two cells:
+In a terminal, navigate to the folder where you cloned exo2micro and launch
+JupyterLab:
 
-```python
-from exo2micro.gui import launch
-gui = launch()
+```bash
+cd Exo2Micro          # or wherever you cloned the repo
+jupyter lab
 ```
+
+Your web browser will open with the JupyterLab interface. In the file browser
+on the left, double-click `exo2micro_notebook.ipynb` to open it, then run
+both setup cells (click in each cell and press Shift+Enter). The exo2micro
+GUI should appear under the second cell.
+
+If you see something like `VBox(children=(HTML(value=...)))` instead of an
+actual GUI, ipywidgets isn't installed correctly — run
+`pip install ipywidgets` in your terminal, then restart the JupyterLab
+kernel (Kernel menu → Restart Kernel) and re-run the cells.
+
+To stop JupyterLab when you're done, return to the terminal window and
+press `Ctrl+C`.
 
 ### Option 2: Python API
 

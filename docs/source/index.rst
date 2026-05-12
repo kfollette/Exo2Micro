@@ -80,9 +80,3 @@ Version
 This documentation is for exo2micro 2.3. The full release history lives
 in ``CHANGELOG.md`` at the repository root. See :doc:`migration` for
 upgrading from earlier versions.
-
-.. todo::
-
-   Replace the placeholder GitHub URL
-   ``https://github.com/your-org/exo2micro`` throughout this
-   documentation with the real repository URL once it's published.

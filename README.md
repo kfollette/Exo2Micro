@@ -91,4 +91,6 @@ A paper describing exo2micro is in preparation. If you use this software in work
 
 ## License
 
-[Your license here]
+exo2micro is released under the MIT License. See the [LICENSE](LICENSE) file for the full text.
+
+In brief: you're free to use, modify, and redistribute this software for any purpose, including commercial use, as long as you retain the copyright notice. The software comes with no warranty.

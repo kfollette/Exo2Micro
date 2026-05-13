@@ -15,11 +15,23 @@ Usage
 
     results = run_batch(
         samples=['CD070', 'CD063'],
-        dyes=['SybrGld_microbe', 'DAPI'],
+        dyes=['SybrGld', 'DAPI'],
         parallel=True,
         n_workers=4,
         output_dir='processed',
     )
+
+Strict vs lenient mode
+----------------------
+By default (``strict_dyes=True``), :func:`run_batch` raises
+:class:`FileNotFoundError` if any requested ``(sample, dye)`` pair has
+no raw files on disk. The error message lists every missing pair so
+typos surface immediately rather than after a long batch.
+
+To skip missing pairs silently (e.g. when you have heterogeneous
+samples where not every dye exists for every sample), pass
+``strict_dyes=False``. Skipped pairs are listed in the run log and
+omitted from the task list.
 
 Notes
 -----
@@ -27,14 +39,24 @@ Parallel mode uses :class:`multiprocessing.Pool`. On macOS this uses
 ``spawn``, so each worker starts a fresh Python interpreter. The
 ``process_one`` function is importable from this module by design.
 
+Memory and execution mode
+-------------------------
+The serial loop in :func:`run_serial` explicitly releases per-task
+memory (matplotlib figures + the :class:`SampleDye` instance) between
+tasks. On low-RAM machines, prefer ``parallel=False`` over
+``parallel=True, n_workers=1`` — the serial loop's cleanup is more
+aggressive than relying on a single worker process to recycle.
+
 Rule of thumb for ``n_workers``:
 ``n_workers * (peak RAM per sample) < available RAM``.
 If images are large (>1 GB each), start with ``n_workers=4`` and
 adjust based on observed memory usage.
 """
 
+import gc
 import os
 from .pipeline import SampleDye
+from .utils import discover_tasks
 
 
 def process_one(args):
@@ -83,19 +105,25 @@ def process_one(args):
     return result
 
 
-def build_task_list(samples, dyes, params=None,
+def build_task_list(pairs, params=None,
                     output_dir='processed', raw_dir='raw',
                     from_stage=None, to_stage=None, force=False,
                     checkpoint_format='tiff'):
     """
     Build the list of ``(sample, dye, params)`` tuples for batch processing.
 
+    This is a low-level helper. Callers are responsible for resolving
+    which ``(sample, dye)`` pairs actually exist on disk — see
+    :func:`exo2micro.utils.discover_tasks`. :func:`run_batch` does this
+    automatically; only call ``build_task_list`` directly if you want
+    full control over which pairs are queued.
+
     Parameters
     ----------
-    samples : list of str
-        Sample names.
-    dyes : list of str
-        Dye/channel names.
+    pairs : list of (str, str) tuples
+        Explicit list of ``(sample, dye)`` combinations to queue. No
+        filesystem checks are performed here; missing files will surface
+        as task-level errors at run time.
     params : dict or None
         Pipeline parameters to apply to all tasks. If ``None``, each
         SampleDye uses its built-in defaults.
@@ -131,13 +159,18 @@ def build_task_list(samples, dyes, params=None,
         task_params['force'] = force
 
     return [(sample, dye, dict(task_params))
-            for dye in dyes
-            for sample in samples]
+            for sample, dye in pairs]
 
 
 def run_serial(tasks):
     """
     Run all tasks sequentially in the current process.
+
+    After each task, explicitly closes all matplotlib figures and runs
+    a garbage-collection pass. This is more aggressive than relying on
+    Python's reference-counted cleanup at scope exit and matters on
+    low-RAM machines processing large images: per-task numpy arrays can
+    otherwise linger long enough to overlap the next task's allocations.
 
     Parameters
     ----------
@@ -150,9 +183,25 @@ def run_serial(tasks):
     list of dict
         Results for each task.
     """
+    # Import here to keep top-of-module import cost low for callers
+    # that only use run_parallel.
+    try:
+        import matplotlib.pyplot as plt
+        have_plt = True
+    except Exception:
+        have_plt = False
+
     results = []
     for args in tasks:
         results.append(process_one(args))
+        # Per-task memory release. Matplotlib's pyplot module retains
+        # references to all open figures even after they're saved to
+        # disk, so explicitly closing them is necessary; gc.collect()
+        # then reclaims any cyclically-referenced numpy arrays that
+        # the reference counter alone wouldn't free immediately.
+        if have_plt:
+            plt.close('all')
+        gc.collect()
     return results
 
 
@@ -186,12 +235,26 @@ def run_parallel(tasks, n_workers=4):
 def run_batch(samples, dyes, parallel=False, n_workers=4,
               params=None, output_dir='processed', raw_dir='raw',
               from_stage=None, to_stage=None, force=False,
-              checkpoint_format='tiff'):
+              checkpoint_format='tiff', strict_dyes=True):
     """
     High-level batch processing entry point.
 
-    Processes every combination of sample × dye, either serially or
-    across a worker pool. Prints a summary table at the end.
+    Resolves the requested ``samples × dyes`` against what's actually
+    on disk, then processes every present combination either serially
+    or across a worker pool, and prints a summary table at the end.
+
+    Discovery and strict mode
+    -------------------------
+    Before queueing tasks, the requested cartesian product is filtered
+    against the filesystem via :func:`exo2micro.utils.discover_tasks`.
+    A pair is considered "present" when both a pre-stain and a
+    post-stain file exist for that dye in the sample's directory.
+
+    - ``strict_dyes=True`` (default): if any requested pair is missing,
+      raise :class:`FileNotFoundError` with a single message listing
+      every missing pair. Catches typos before a long batch starts.
+    - ``strict_dyes=False``: missing pairs are skipped silently (their
+      reasons are printed in the batch summary, not raised).
 
     Parameters
     ----------
@@ -201,7 +264,10 @@ def run_batch(samples, dyes, parallel=False, n_workers=4,
         Dye/channel names.
     parallel : bool
         Use multiprocessing (default ``False``). For small batches
-        serial is usually faster due to spawn overhead.
+        serial is usually faster due to spawn overhead. On low-RAM
+        machines prefer ``parallel=False`` over ``parallel=True,
+        n_workers=1`` — the serial loop releases memory more
+        aggressively between tasks.
     n_workers : int
         Number of workers when ``parallel=True`` (default 4).
     params : dict or None
@@ -221,13 +287,77 @@ def run_batch(samples, dyes, parallel=False, n_workers=4,
         checkpoint (default ``'tiff'``). Using ``'tiff'`` or
         ``'fits'`` alone cuts disk usage roughly in half compared
         to ``'both'``.
+    strict_dyes : bool
+        If True (default), raise :class:`FileNotFoundError` when any
+        requested ``(sample, dye)`` pair has no raw files on disk.
+        Set to False to skip such pairs silently and run only the
+        present ones.
 
     Returns
     -------
     list of dict
-        One result per sample+dye combination.
+        One result per resolvable sample+dye combination.
+
+    Raises
+    ------
+    FileNotFoundError
+        When ``strict_dyes=True`` and one or more requested
+        ``(sample, dye)`` pairs cannot be resolved from raw files,
+        OR when the raw directory itself has a fatal layout problem
+        (missing, empty, no per-sample subfolders) regardless of
+        ``strict_dyes``.
     """
-    tasks = build_task_list(samples, dyes, params, output_dir, raw_dir,
+    # Resolve requested pairs against the filesystem.
+    discovery = discover_tasks(samples, dyes, raw_dir=raw_dir)
+
+    if not discovery['layout_ok']:
+        # Layout problem (missing raw_dir, all-empty subdirs, etc.)
+        # is always fatal regardless of strict_dyes — there are no
+        # pairs to run at all.
+        layout_msg = next(
+            (w for s, w in discovery['warnings'] if s == '(layout)'),
+            f"raw directory '{raw_dir}' is not usable")
+        raise FileNotFoundError(layout_msg)
+
+    present = discovery['present']
+    skipped = discovery['skipped']
+    warnings_list = [(s, w) for s, w in discovery['warnings']
+                     if s != '(layout)']
+
+    # Surface filename warnings (separate from missing-pair "skipped"
+    # entries) so the user knows about adjacent issues that didn't
+    # block their requested pairs.
+    if warnings_list:
+        print(f"\nFilename warnings ({len(warnings_list)}):")
+        for sample, w in warnings_list:
+            print(f"  [{sample}] {w}")
+
+    if skipped:
+        if strict_dyes:
+            # Build one message listing every missing pair so the user
+            # sees all typos in one shot.
+            lines = ["Some requested (sample, dye) pairs have no "
+                     "raw files on disk:"]
+            for sample, dye, reason in skipped:
+                lines.append(f"  - {sample} / {dye}: {reason}")
+            lines.append("")
+            lines.append("Fix: either add the missing files, correct "
+                         "typos in your sample/dye lists, or pass "
+                         "strict_dyes=False to run_batch to skip "
+                         "missing pairs and process the rest.")
+            raise FileNotFoundError("\n".join(lines))
+        else:
+            print(f"\nSkipping {len(skipped)} (sample, dye) pair(s) "
+                  f"with no raw files:")
+            for sample, dye, reason in skipped:
+                print(f"  - {sample} / {dye}: {reason}")
+
+    if not present:
+        print("\nNo runnable (sample, dye) pairs after discovery — "
+              "nothing to do.")
+        return []
+
+    tasks = build_task_list(present, params, output_dir, raw_dir,
                             from_stage, to_stage, force,
                             checkpoint_format=checkpoint_format)
 

@@ -3,7 +3,129 @@
 This file summarizes notable changes across exo2micro 2.x. For
 upgrading existing code and scripts, see `docs/source/migration.rst`.
 
-## Version 2.3.0 — Current release
+## Version 2.3.1 — Current release
+
+### Discovery and error messages
+
+- **New `diagnose_raw_layout(raw_dir)`** function in `exo2micro.utils`.
+  Detects the four common "no images found" failure modes — `raw_dir`
+  missing, `raw_dir` empty, TIFFs sitting directly in `raw_dir` with
+  no per-sample subfolders, and subfolders that contain no TIFFs —
+  and returns a structured report with a human-readable multi-line
+  error message. The message includes the canonical directory layout
+  and filename rules so users see exactly what to fix.
+- **New `discover_tasks(samples, dyes, raw_dir)`** function in
+  `exo2micro.utils`. Resolves a requested `samples × dyes` product
+  against the actual contents of the raw directory and returns three
+  lists: pairs that have both pre- and post-stain files (`present`),
+  pairs that were requested but cannot run (`skipped`, with a short
+  reason each), and per-file warnings about filename problems. Used
+  internally by `run_batch` and the GUI so they share one source of
+  truth for "what's actually runnable here?"
+- **`survey_raw_channels` now finds `.tiff` files** in addition to
+  `.tif`, and is case-insensitive on both extensions. The previous
+  glob pattern `**/*.tif` was case-sensitive on Linux/macOS and
+  missed `.tiff` files entirely — a silent failure mode that left
+  users wondering why their images weren't being detected. Calls
+  `diagnose_raw_layout` upfront, so layout problems produce the same
+  diagnostic message everywhere.
+- **Shared `_is_tiff(name)` helper** (private) so `classify_raw_files`,
+  `survey_raw_channels`, and `diagnose_raw_layout` apply the same
+  filename rule. Adding support for new extensions is now a one-line
+  change.
+- **`load_image_pair` error message** for "No raw files matching dye
+  'X'" now detects when the requested dye name contains underscores
+  (a common typo) and explains the no-underscores rule with a
+  concrete fix suggestion.
+- **`EMPTY DYE` warning** in `classify_raw_files` now recaps the
+  no-underscores rule, so users who hit it understand both what's
+  wrong with this file and what's required generally.
+
+### Heterogeneous samples and the strict_dyes flag
+
+- **`run_batch` resolves pairs against the filesystem** before
+  queueing tasks via `discover_tasks`. A new `strict_dyes` parameter
+  controls what happens when some requested `(sample, dye)` pairs
+  have no raw files:
+  - `strict_dyes=True` (default): raise `FileNotFoundError` with a
+    single message listing every missing pair. Catches typos before
+    a long batch starts.
+  - `strict_dyes=False`: skip missing pairs silently and run only
+    the present ones. Useful when not every dye exists for every
+    sample.
+- **Behavior change**: an existing `run_batch(...)` call that
+  previously let missing pairs fail one-by-one as tasks will now
+  raise immediately under the new default. To restore the old
+  best-effort behavior, pass `strict_dyes=False`.
+- **`build_task_list` signature change**: now takes a `pairs` list
+  of `(sample, dye)` tuples rather than separate `samples` and
+  `dyes` arguments. Callers that need the full cartesian product
+  can build it themselves or call `run_batch`. This is a
+  backward-incompatible change for code that called
+  `build_task_list` directly — most users won't have done so.
+- **GUI: pre-flight check before run.** When the user clicks Run,
+  the GUI now resolves the requested `samples × dyes` against the
+  raw directory before launching. If any pairs are missing, a
+  warning banner lists them and offers "Confirm and run anyway"
+  (proceed with present pairs only) or "Cancel". If the raw
+  directory itself has a fatal layout problem, the run is blocked
+  with a layout-diagnosis message.
+- **GUI: muted "(no files)" tiles** for skipped pairs. After the
+  active task tiles, a second row of gray dashed-border tiles
+  shows every pair that was requested but couldn't run, with the
+  reason inline. The user always sees what's filtered out.
+- **GUI auto-detect uses `diagnose_raw_layout`** at the top of
+  `_on_detect`, so a missing/malformed raw directory produces the
+  same plain-English explanation in the GUI as it does at the API
+  level.
+
+### Memory release between samples
+
+- **`run_serial` now closes all matplotlib figures and runs a
+  garbage-collection pass** between tasks. Matplotlib's pyplot
+  module retains references to all open figures even after they're
+  saved to disk; explicit cleanup is needed for those to release.
+  On low-RAM machines processing large images, per-task numpy arrays
+  could otherwise linger long enough to overlap the next task's
+  allocations.
+- **`SampleDye._results` is trimmed** at the end of stage 4 to
+  remove transient cross-stage state (`warp_matrix`,
+  `warp_matrix_interior`, `interior_ecc_result`, `pre_pad`,
+  `debug_data`). Only the small scalar values used by the return
+  dict (`scale_estimate`, `scale_percentile_value`) remain.
+- **`debug_data` is dropped at the end of stage 2** after its
+  downsampled image arrays have been consumed by
+  `_generate_alignment_plots`. Previously it sat in `self._results`
+  through stages 3 and 4, holding onto several downsampled image
+  arrays for no reason.
+- **GUI: plain-language memory guidance** added to the Execution
+  tab in the Advanced Parameters accordion, explaining when to
+  leave parallel mode off. Also added as a tooltip on the
+  "Run samples in parallel" checkbox.
+- **New documentation page**:
+  `docs/source/users/memory_and_performance.rst` covers when to
+  use serial vs parallel mode, how to size `n_workers`, and what
+  to do if you hit out-of-memory errors.
+
+### Documentation
+
+- README: fixed `SybrGld_microbe` examples to `SybrGld` (the
+  no-underscores rule was added in 2.3 but the examples weren't
+  updated). Added a Memory and parallel mode subsection pointing
+  to the new docs page.
+- `docs/source/users/troubleshooting.rst`: added entries for the
+  new layout-diagnostic and missing-pair error messages.
+- `docs/source/developers/scripting_api.rst`: documented
+  `discover_tasks`, `diagnose_raw_layout`, and the new
+  `strict_dyes` parameter on `run_batch`. Fixed the
+  `SybrGld_microbe` example.
+- `exo2micro/__init__.py`: module docstring examples updated to
+  use `SybrGld` and demonstrate `strict_dyes`. `discover_tasks`
+  and `diagnose_raw_layout` are now public exports.
+
+---
+
+## Version 2.3.0
 
 ### Output folder simplification and visualisation
 

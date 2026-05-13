@@ -24,19 +24,28 @@ Quick start
     import exo2micro as e2m
 
     # Process a single sample+dye combination
-    run = e2m.SampleDye('CD070', 'SybrGld_microbe')
+    run = e2m.SampleDye('CD070', 'SybrGld')
     run.run()
 
     # With an additional manual scale override
     run.set_params(manual_scale=1.42)
     run.run(from_stage=4)
 
-    # Batch processing
+    # Batch processing (strict_dyes=True by default — raises if any
+    # requested (sample, dye) pair is missing on disk)
     results = e2m.run_batch(
         samples=['CD070', 'CD063'],
-        dyes=['SybrGld_microbe', 'DAPI'],
+        dyes=['SybrGld', 'DAPI'],
         parallel=True,
         n_workers=4,
+    )
+
+    # For heterogeneous datasets where not every dye exists for every
+    # sample, pass strict_dyes=False to skip missing pairs:
+    results = e2m.run_batch(
+        samples=['CD070', 'CD063'],
+        dyes=['SybrGld', 'DAPI', 'Cy5'],
+        strict_dyes=False,
     )
 
 Interactive GUI
@@ -60,7 +69,7 @@ legacy     : Deprecated / superseded functions retained for back-compat.
              helpers formerly in ``scaling.py``.
 """
 
-__version__ = '2.3.0'
+__version__ = '2.3.1'
 
 # Primary API: the SampleDye pipeline class
 from .pipeline import SampleDye
@@ -73,6 +82,8 @@ from .alignment import register_highorder, prealign_phase_correlation
 from .utils import (
     load_image_pair,
     classify_raw_files,
+    diagnose_raw_layout,
+    discover_tasks,
     estimate_pipeline_output_size,
     get_free_disk_space,
     format_bytes,

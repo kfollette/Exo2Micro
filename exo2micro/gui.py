@@ -677,6 +677,14 @@ class ExoMicroGUI:
             description='Run samples in parallel (multiprocessing)',
             style={'description_width': 'initial'},
             layout=widgets.Layout(width='auto'),
+            tooltip=(
+                "Leave OFF if your computer has limited RAM (8 GB or "
+                "less), or if you're processing very large images. "
+                "The one-at-a-time mode actively clears each sample "
+                "out of memory before starting the next one. Turn ON "
+                "only if you have plenty of RAM to spare — see the "
+                "guidance below for how to pick a worker count."
+            ),
         )
         self._n_workers = widgets.IntSlider(
             value=2, min=1, max=16, step=1,
@@ -694,6 +702,18 @@ When it's on, the pipeline launches multiple worker processes that
 each process one combination concurrently. For large batches this
 can give a significant speedup, but it comes with real memory and
 CPU tradeoffs.</p>
+
+<p style="background:#f5f9ff; border-left:4px solid #2a6fb8;
+          padding:8px 10px; margin:8px 0;">
+<b>💡 Running out of memory?</b> If your computer has limited RAM
+(say, 8&nbsp;GB or less), or your images are very large, leave
+<i>Run samples in parallel</i> turned <b>off</b>. Even though it sounds
+slower, the one-at-a-time mode actively clears each sample out of
+memory before starting the next one, so you can process big batches
+without your machine running out of RAM. Parallel mode is faster when
+you have memory to spare, but each parallel worker holds its own copy
+of the current sample's images — so 4 workers means 4× the memory
+use.</p>
 
 <p><b>When to enable it.</b> Parallel mode is worthwhile when:</p>
 <ul style="margin-top:2px; margin-bottom:8px;">
@@ -1135,6 +1155,7 @@ usage in these tools, see
         'running': ('🔄', '#0066cc', '#e7f0fb', '#99c2ff'),
         'done':    ('✅', '#2a7a2a', '#eaf7ea', '#9fd39f'),
         'error':   ('❌', '#cc0000', '#fbeaea', '#d99'),
+        'skipped': ('—',  '#999',    '#f0f0f0', '#d0d0d0'),
     }
 
     def _build_task_tile(self, sample, dye):
@@ -1231,14 +1252,92 @@ usage in these tools, see
         )
         return container
 
-    def _show_tiles(self, task_pairs):
+    def _show_tiles(self, task_pairs, skipped_pairs=None):
         """Create and display the tile grid for a new run.
 
         Replaces any existing tile grid in the run section's dedicated
         tile slot. Called once at the start of :meth:`_run_pipeline`.
+
+        Parameters
+        ----------
+        task_pairs : list of (sample, dye) tuples
+            Tasks that will actually run, rendered as active tiles
+            that cycle waiting → running → done/error.
+        skipped_pairs : list of (sample, dye, reason) tuples or None
+            Tasks that were requested but have no raw files on disk.
+            Rendered as muted gray "(no files)" tiles after the
+            active ones so the user can see what got filtered.
         """
         container = self._build_tiles_container(task_pairs)
-        self._tiles_slot.children = (container,)
+        children = [container]
+
+        if skipped_pairs:
+            children.append(self._build_skipped_tiles_container(skipped_pairs))
+
+        self._tiles_slot.children = tuple(children)
+
+    def _show_skipped_tiles(self, skipped_pairs):
+        """Append a row of muted "(no files)" tiles for skipped pairs.
+
+        Used when _show_tiles has already been called but skipped
+        pairs need to be added separately (rare; mainly for the
+        flow where _run_pipeline does its own discovery and wants
+        to update the tile area after _show_tiles).
+        """
+        existing = list(self._tiles_slot.children)
+        existing.append(self._build_skipped_tiles_container(skipped_pairs))
+        self._tiles_slot.children = tuple(existing)
+
+    def _build_skipped_tiles_container(self, skipped_pairs):
+        """Build the muted gray tile row for pairs with no raw files.
+
+        Each tile shows the sample/dye name and the short reason from
+        :func:`discover_tasks`. Tiles in this row are not interactive
+        and are not stored in ``self._task_tiles`` (so the run loop
+        never tries to update them).
+        """
+        tile_widgets = []
+        for sample, dye, reason in skipped_pairs:
+            html = self._render_skipped_tile(sample, dye, reason)
+            tile_widgets.append(
+                widgets.HTML(
+                    value=html,
+                    layout=widgets.Layout(
+                        width='240px',
+                        height='auto',
+                        min_height='80px',
+                        margin='4px',
+                    ),
+                ))
+        return widgets.Box(
+            children=tile_widgets,
+            layout=widgets.Layout(
+                display='flex',
+                flex_flow='row wrap',
+                align_items='flex-start',
+                padding='4px 0',
+                margin='2px 0',
+            ),
+        )
+
+    def _render_skipped_tile(self, sample, dye, reason):
+        """Return HTML for a muted (no files) tile."""
+        icon, fg, bg, border = self._TILE_STATES['skipped']
+        label = f'{sample} / {dye}'
+        # Escape the reason text so unusual paths can't break layout
+        r = (reason.replace('&', '&amp;')
+                   .replace('<', '&lt;')
+                   .replace('>', '&gt;'))
+        return (
+            f'<div style="border:1px dashed {border}; background:{bg}; '
+            f'border-radius:4px; padding:8px 10px; min-height:60px; '
+            f'opacity:0.75;">'
+            f'<div style="color:{fg}; font-weight:bold; font-size:12px;">'
+            f'{icon} {label}</div>'
+            f'<div style="color:#777; font-size:11px; margin-top:4px; '
+            f'line-height:1.3;">(no files) {r}</div>'
+            f'</div>'
+        )
 
     def _clear_tiles(self):
         """Remove all task tiles from the run section."""
@@ -1352,16 +1451,29 @@ usage in these tools, see
     def _compute_disk_estimate(self):
         """Compute the disk-space estimate for the current run plan.
 
+        Calls :func:`discover_tasks` to filter the requested
+        ``samples × dyes`` down to pairs that actually exist on disk,
+        then estimates output footprint for those present pairs only.
+        Pairs requested but missing on disk are surfaced via
+        ``skipped`` in the returned dict so the GUI can render them as
+        muted tiles or display them in the confirm banner.
+
         Returns a dict with keys ``total_bytes``, ``free_bytes``,
-        ``n_tasks``, ``warnings``, and ``needs_confirm`` (True if the
-        estimated output exceeds 90% of free space).
+        ``n_tasks``, ``n_resolvable``, ``warnings``, ``needs_confirm``
+        (True if the estimated output exceeds 90% of free space),
+        ``present``, ``skipped``, and ``layout_ok``.
         """
         from .utils import (estimate_pipeline_output_size,
-                            get_free_disk_space, format_bytes)
+                            get_free_disk_space, format_bytes,
+                            discover_tasks)
 
         samples = self._get_samples()
         dyes = self._get_dyes()
-        pairs = [(s, d) for s in samples for d in dyes]
+
+        # Resolve against the filesystem.
+        discovery = discover_tasks(samples, dyes, raw_dir=self.raw_dir)
+        present = discovery['present']
+        skipped = discovery['skipped']
 
         params = self._get_params()
         n_scale_methods = 1  # always Moffat
@@ -1371,7 +1483,7 @@ usage in these tools, see
             n_scale_methods += 1
 
         estimate = estimate_pipeline_output_size(
-            pairs,
+            present,
             raw_dir=self.raw_dir,
             pad=params.get('pad', 2000),
             save_all_intermediates=params.get('save_all_intermediates', False),
@@ -1394,6 +1506,9 @@ usage in these tools, see
             'warnings': estimate['warnings'],
             'needs_confirm': needs_confirm,
             'format_bytes': format_bytes,
+            'present': present,
+            'skipped': skipped,
+            'layout_ok': discovery['layout_ok'],
         }
 
     def _update_disk_estimate_display(self, estimate=None):
@@ -1453,13 +1568,66 @@ usage in these tools, see
         self._confirm_proceed_btn.layout.visibility = 'visible'
         self._confirm_cancel_btn.layout.visibility = 'visible'
 
+    def _show_missing_pairs_banner(self, skipped, present_count):
+        """Display the missing-pairs banner and reveal its buttons.
+
+        Shown when the user requested ``(sample, dye)`` combinations
+        that don't exist on disk. "Confirm and run anyway" proceeds
+        with only the present pairs; "Cancel" stops the run so the
+        user can fix the inputs.
+
+        Parameters
+        ----------
+        skipped : list of (sample, dye, reason) tuples
+            Pairs that were requested but cannot run.
+        present_count : int
+            How many pairs DO have raw files. Shown to give the user
+            a sense of "is this skipping 2 of 30 or 28 of 30?".
+        """
+        n_skip = len(skipped)
+        # Show up to 8 missing pairs inline; collapse the rest behind a count.
+        rows = []
+        for sample, dye, reason in skipped[:8]:
+            rows.append(
+                f'<li><b>{sample}</b> / <b>{dye}</b> — '
+                f'<span style="color:#7a1a1a;">{reason}</span></li>')
+        if n_skip > 8:
+            rows.append(f'<li>… and {n_skip - 8} more</li>')
+        rows_html = '\n'.join(rows)
+
+        self._confirm_banner.value = (
+            f'<div style="background:#fff3cd; border:2px solid #cc8800; '
+            f'padding:12px; border-radius:4px; margin:8px 0; '
+            f'color:#5a3a00;">'
+            f'<b>⚠ Some requested (sample, dye) pairs have no raw files</b>'
+            f'<br><br>'
+            f'<b>{present_count}</b> pair(s) can run, but <b>{n_skip}</b> '
+            f'are missing from the raw directory:'
+            f'<ul style="margin:6px 0 6px 18px;">{rows_html}</ul>'
+            f'Most often this is a typo in the sample or dye list, or '
+            f'a file that hasn\'t been copied into the raw directory yet.'
+            f'<br><br>'
+            f'Click <b>Confirm and run anyway</b> to run the '
+            f'{present_count} present pair(s) and skip the missing ones, '
+            f'or <b>Cancel</b> to fix the inputs first.'
+            f'</div>'
+        )
+        self._confirm_proceed_btn.layout.visibility = 'visible'
+        self._confirm_cancel_btn.layout.visibility = 'visible'
+
     def _hide_confirm_banner(self):
         self._confirm_banner.value = ''
         self._confirm_proceed_btn.layout.visibility = 'hidden'
         self._confirm_cancel_btn.layout.visibility = 'hidden'
 
     def _on_confirm_proceed(self, btn):
-        """User clicked the override button — proceed with the pending run."""
+        """User clicked the override button — proceed with the pending run.
+
+        Both the disk-space banner and the missing-pairs banner use
+        this handler. The pending args dict carries whatever overrides
+        were needed (e.g. ``strict_dyes=False`` from missing-pairs
+        flow), so this handler just replays them.
+        """
         self._hide_confirm_banner()
         if self._pending_run_args is not None:
             args = self._pending_run_args
@@ -1467,10 +1635,15 @@ usage in these tools, see
             self._run_pipeline(**args)
 
     def _on_confirm_cancel(self, btn):
-        """User clicked cancel — drop the pending run."""
+        """User clicked cancel — drop the pending run.
+
+        Works for both the disk-space banner and the missing-pairs
+        banner. The generic wording covers both cases without needing
+        to track which banner was up.
+        """
         self._hide_confirm_banner()
         self._pending_run_args = None
-        self._log('run', "Run cancelled — disk space was insufficient.")
+        self._log('run', "Run cancelled — fix the inputs and click Run again.")
 
     def _show_progress(self, value, max_val, label=''):
         self._progress.max = max_val
@@ -1595,23 +1768,34 @@ usage in these tools, see
     def _on_detect(self, btn):
         """Auto-detect samples and dyes from the raw directory.
 
-        Uses :func:`classify_raw_files` on each sample subdirectory.
-        Results are reported into the Input Selection section's
-        mini-output (and the main log). After a successful detect,
-        the disk-space estimate is recomputed.
+        Uses :func:`diagnose_raw_layout` to catch top-level layout
+        problems (missing dir, flat files with no per-sample folders,
+        etc.) before falling through to per-sample dye discovery via
+        :func:`classify_raw_files`. Results are reported into the Input
+        Selection section's mini-output (and the main log). After a
+        successful detect, the disk-space estimate is recomputed.
         """
-        from .utils import classify_raw_files
+        from .utils import classify_raw_files, diagnose_raw_layout
 
         self._detect_status.value = (
             '<span style="color:#888;">Scanning...</span>')
         self._clear_section('input')
 
         raw = self.raw_dir
-        if not os.path.isdir(raw):
-            msg = f'Directory not found: {raw}'
+
+        # Layout-level pre-check. Catches missing dirs, empty dirs,
+        # flat layouts (TIFFs at top level instead of in per-sample
+        # subdirectories), and all-empty subdirs with a single
+        # human-readable explanation rather than the previous
+        # one-line "Directory not found".
+        layout = diagnose_raw_layout(raw)
+        if not layout['ok']:
+            short = layout['message'].splitlines()[0]
             self._detect_status.value = (
-                f'<span style="color:red;">{msg}</span>')
-            self._log('input', f"⚠️  {msg}")
+                f'<span style="color:red;">{short}</span>')
+            self._log('input', "⚠️  Raw directory layout problem:")
+            for line in layout['message'].splitlines():
+                self._log('input', f"    {line}")
             self._expand_section('input')
             return
 
@@ -1708,9 +1892,17 @@ usage in these tools, see
                   "main log below.")
 
     def _on_run(self, btn):
-        """Run button handler: validate inputs, run the disk-space
-        precheck, and either dispatch to :meth:`_run_pipeline` directly
-        or stash the run args and show the confirmation banner.
+        """Run button handler: validate inputs, run pre-flight checks
+        (missing pairs first, then disk space), and either dispatch to
+        :meth:`_run_pipeline` directly or stash the run args and show
+        the appropriate confirmation banner.
+
+        Order matters: missing-pairs evaluation has to come before the
+        disk-space estimate, because the disk estimate depends on how
+        many pairs will actually run. If the user has both problems at
+        once, the missing-pairs banner fires first; once they confirm
+        skipping (or fix the inputs and click Run again), the disk
+        check evaluates against the reduced set.
         """
         samples = self._get_samples()
         dyes = self._get_dyes()
@@ -1739,13 +1931,61 @@ usage in these tools, see
             parallel=self._parallel_check.value,
             n_workers=self._n_workers.value,
             checkpoint_format=self._checkpoint_format.value,
+            strict_dyes=True,
         )
 
-        # Disk space precheck. Always compute; only gate on it if the
-        # estimate exceeds 90% of free space.
+        # ── Pre-flight check 1: layout + missing pairs ─────────────────
+        # Resolve the cartesian product against the filesystem. If the
+        # raw directory has a fatal layout problem, fail with the same
+        # human-readable message the API would emit. If individual
+        # pairs are missing, prompt the user to confirm skipping.
         estimate = self._compute_disk_estimate()
         self._update_disk_estimate_display(estimate)
 
+        if not estimate.get('layout_ok', True):
+            # The raw_dir itself is unusable. Surface the message that
+            # diagnose_raw_layout produced via discover_tasks, which is
+            # carried in estimate['warnings'] as a layout entry.
+            from .utils import diagnose_raw_layout
+            layout = diagnose_raw_layout(self.raw_dir)
+            self._log('run', "⚠️  Raw directory layout problem — cannot run.")
+            for line in layout['message'].splitlines():
+                self._log('run', f"    {line}")
+            self._expand_section('run')
+            return
+
+        skipped = estimate.get('skipped', [])
+        present = estimate.get('present', [])
+
+        if not present:
+            self._log('run',
+                      "⚠️  No (sample, dye) pairs could be resolved from "
+                      "the raw directory — nothing to run.")
+            if skipped:
+                self._log('run',
+                          f"   {len(skipped)} requested pair(s) had no "
+                          f"matching files. Click Auto-detect to see "
+                          f"what's actually present.")
+            self._expand_section('run')
+            return
+
+        if skipped:
+            # Stash the run args with strict_dyes=False so that if the
+            # user confirms, the pipeline will skip the missing pairs
+            # instead of raising.
+            run_args['strict_dyes'] = False
+            self._pending_run_args = run_args
+            self._show_missing_pairs_banner(skipped, present_count=len(present))
+            self._log('run',
+                      f"Run paused — {len(skipped)} (sample, dye) "
+                      f"pair(s) have no raw files (see banner above). "
+                      f"Click 'Confirm and run anyway' to run the "
+                      f"{len(present)} present pair(s) and skip the "
+                      f"missing ones, or 'Cancel' to fix the inputs.")
+            self._expand_section('run')
+            return
+
+        # ── Pre-flight check 2: disk space ─────────────────────────────
         if estimate['needs_confirm']:
             self._pending_run_args = run_args
             self._show_confirm_banner(estimate)
@@ -1868,26 +2108,39 @@ usage in these tools, see
 
     def _run_pipeline(self, samples, dyes, params, force, from_stage,
                       to_stage, show_inline, parallel, n_workers,
-                      checkpoint_format='tiff'):
+                      checkpoint_format='tiff', strict_dyes=True):
         """Actually execute the pipeline.
 
-        Invoked either directly from :meth:`_on_run` when the
-        disk-space precheck passes, or from :meth:`_on_confirm_proceed`
-        when the user overrides the precheck.
+        Invoked either directly from :meth:`_on_run` when both
+        pre-flight checks pass, or from :meth:`_on_confirm_proceed`
+        when the user overrides one. The ``strict_dyes`` flag carries
+        the user's choice from the missing-pairs banner: True means
+        any unresolvable pair would have raised in :func:`run_batch`,
+        but we already evaluated that in :meth:`_on_run` and either
+        returned early or got user consent before getting here.
 
         Creates a grid of task tiles (one per sample × dye) in the Run
-        section, then executes the batch. In serial mode each task's
-        tile cycles waiting → running → done/error. In parallel mode
-        tiles also update as :meth:`multiprocessing.Pool.imap_unordered`
-        yields completed results, and inline previews are shown for
-        each completed task.
+        section. Pairs that exist on disk render as active tiles that
+        cycle waiting → running → done/error. Pairs that were
+        requested but have no raw files render as muted gray tiles
+        with a "(no files)" label so the user can see at a glance
+        what was filtered out.
+
+        In serial mode each active tile cycles waiting → running →
+        done/error. In parallel mode tiles also update as
+        :meth:`multiprocessing.Pool.imap_unordered` yields completed
+        results, and inline previews are shown for each completed task.
 
         The ``checkpoint_format`` kwarg controls which file format(s)
         each :class:`SampleDye` writes for its intermediates.
         """
-        # Build the full (sample, dye) task list in a stable order so
-        # tiles can be laid out deterministically.
-        task_pairs = [(s, d) for s in samples for d in dyes]
+        # Re-resolve here (rather than reusing _on_run's discovery)
+        # because _on_confirm_proceed → _run_pipeline can be called
+        # after the user has had time to edit the raw directory.
+        from .utils import discover_tasks
+        discovery = discover_tasks(samples, dyes, raw_dir=self.raw_dir)
+        task_pairs = discovery['present']           # runnable
+        skipped_pairs = discovery['skipped']        # rendered muted
         total_tasks = len(task_pairs)
         results = []
 
@@ -1897,14 +2150,30 @@ usage in these tools, see
         self._show_abort_button()
 
         # Initialise the tile grid before printing anything else so it
-        # appears above the run log.
-        self._show_tiles(task_pairs)
+        # appears above the run log. Active tiles first, muted tiles
+        # for skipped pairs after.
+        self._show_tiles(task_pairs, skipped_pairs=skipped_pairs)
 
         # Main output still captures the full stream. Expand the Run
         # Mini-output so the user sees activity immediately.
         self._expand_section('run')
         with self._output:
             clear_output()
+
+        if skipped_pairs:
+            self._log('run',
+                      f"⏭  Skipping {len(skipped_pairs)} (sample, dye) "
+                      f"pair(s) with no raw files:")
+            for sample, dye, reason in skipped_pairs:
+                self._log('run', f"    {sample} / {dye} — {reason}")
+            self._log('run', "")
+
+        if not task_pairs:
+            self._log('run',
+                      "⚠️  No runnable (sample, dye) pairs after "
+                      "discovery — nothing to do.")
+            self._hide_abort_button()
+            return
 
         # Open the persistent run log via TeeStdout so EVERY line of
         # pipeline output (including raw print() calls inside library

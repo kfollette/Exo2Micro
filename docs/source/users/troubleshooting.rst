@@ -3,6 +3,68 @@ Troubleshooting
 
 This page catalogues common problems and what to do about them.
 
+"No raw files found" / "Raw image directory not found"
+------------------------------------------------------
+
+When you click Auto-detect (or call :func:`~exo2micro.survey_raw_channels`
+or :func:`~exo2micro.run_batch`) and exo2micro reports a layout problem,
+the message will be one of the following. All four come from
+:func:`~exo2micro.diagnose_raw_layout` and include the canonical
+directory layout in the message itself, so you can copy-paste straight
+into your file manager.
+
+**Raw image directory not found.**
+The ``raw_dir`` you pointed exo2micro at doesn't exist. Most often this
+means the GUI was launched from a different folder than the one
+containing your ``raw/`` directory. Either move your raw directory to
+the working directory, ``cd`` into the right place before launching
+JupyterLab, or pass an absolute path: ``raw_dir='/full/path/to/raw'``.
+
+**Raw image directory is empty.**
+The directory exists but contains nothing. Drop your sample folders
+into it (one folder per sample, with paired pre/post TIFFs inside).
+
+**Found N TIFF file(s) directly inside <raw_dir>, but no per-sample
+subfolders.**
+The most common mistake. exo2micro requires each sample to live in
+its own subdirectory under ``raw_dir``. Putting all images flat in
+``raw/`` is the natural thing to do but exo2micro can't tell which
+files belong to which sample. Fix: make a folder for each sample
+(``raw/Sample001/``, ``raw/Sample002/``, ...) and move that sample's
+pre/post files into its folder.
+
+**Found N sample subdirectory(ies) under <raw_dir>, but none of them
+contain any TIFF files.**
+The folder structure is right but the folders themselves are empty
+(or contain only non-TIFF files). Check that your images are
+``.tif`` or ``.tiff`` (case-insensitive) and that they're actually
+inside the sample folder, not next to it.
+
+"Some requested (sample, dye) pairs have no raw files"
+------------------------------------------------------
+
+When you call :func:`~exo2micro.run_batch` with the default
+``strict_dyes=True``, requesting a ``(sample, dye)`` combination
+that doesn't exist on disk raises :class:`FileNotFoundError` with
+a single message listing every missing pair. The most common
+causes:
+
+- **Typo in a sample or dye name.** Check the listed dyes against
+  your raw filenames. Dye matching is case-sensitive: ``DAPI`` and
+  ``dapi`` are different.
+- **Heterogeneous samples.** Not every dye exists for every sample.
+  Either trim your sample/dye lists, or pass ``strict_dyes=False``
+  to skip missing pairs and process the rest.
+- **Files not copied over yet.** The pair really doesn't exist —
+  add the missing files, or remove the affected sample/dye from
+  your run.
+
+In the GUI, the same situation produces a warning banner above the
+Run button with a "Confirm and run anyway" option that automatically
+sets ``strict_dyes=False`` for that run. Missing pairs render as
+muted gray tiles with a "(no files)" label so you can see what was
+filtered out at a glance.
+
 Alignment doesn't look right
 ----------------------------
 
@@ -296,6 +358,14 @@ dye exo2micro *did* find in that directory.
 *Fix:* either remove that dye from your run for that sample, or
 check for typos against the listed dyes. Note that dye matching is
 case-sensitive — ``DAPI`` and ``dapi`` are different.
+
+If the requested dye name contains an underscore, the error message
+also explicitly flags that as a likely problem and suggests the
+correct dye name. The most common mistake is asking for
+``'SybrGld_microbe'`` when the dye is actually ``'SybrGld'`` and
+``'microbe'`` was just a descriptor in the filename. Dye names must
+not contain underscores; the dye is whatever comes between the
+last underscore and the extension.
 
 **Sample directory not found: <path>**
 

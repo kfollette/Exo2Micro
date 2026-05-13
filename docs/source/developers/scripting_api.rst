@@ -53,7 +53,7 @@ Result is a dict::
 
    {
        'sample': 'CD070',
-       'dye': 'SybrGld_microbe',
+       'dye': 'SybrGld',
        'scale_estimate': 1.234,
        'scale_percentile_value': None,
        'manual_scale': None,
@@ -143,7 +143,7 @@ For multiple samples × dyes, use :func:`~exo2micro.run_batch`::
 
    results = e2m.run_batch(
        samples=['CD070', 'CD063', 'CD055'],
-       dyes=['SybrGld_microbe', 'DAPI'],
+       dyes=['SybrGld', 'DAPI'],
        parallel=True,
        n_workers=4,
        output_dir='processed',
@@ -154,7 +154,7 @@ Parameters common to every task are passed via ``params=``::
 
    results = e2m.run_batch(
        samples=['CD070', 'CD063'],
-       dyes=['SybrGld_microbe'],
+       dyes=['SybrGld'],
        params={'boundary_width': 20, 'scale_percentile': 50.0},
        parallel=True,
    )
@@ -163,12 +163,52 @@ Run-control kwargs work at batch level too::
 
    results = e2m.run_batch(
        samples=['CD070', 'CD063'],
-       dyes=['SybrGld_microbe'],
+       dyes=['SybrGld'],
        from_stage=4,       # only rerun diagnostics
        force=True,
    )
 
 A summary table is printed at the end.
+
+Strict vs lenient dye resolution
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Before queueing tasks, :func:`~exo2micro.run_batch` resolves the
+requested ``samples × dyes`` product against the actual contents
+of ``raw_dir`` via :func:`~exo2micro.discover_tasks`. A pair is
+"present" when both a pre-stain and a post-stain file exist for
+that dye in that sample's directory.
+
+The ``strict_dyes`` parameter controls what happens when some
+requested pairs are missing on disk:
+
+- ``strict_dyes=True`` (default): raise
+  :class:`FileNotFoundError` with one message listing every
+  missing pair. Catches typos before a long batch starts.
+- ``strict_dyes=False``: skip missing pairs silently, log a
+  short summary, and run only the present ones. Use this when
+  your samples are heterogeneous (not every dye exists for every
+  sample).
+
+::
+
+   # Strict — fails if any of CD070, CD063, CD055 are missing any dye:
+   results = e2m.run_batch(
+       samples=['CD070', 'CD063', 'CD055'],
+       dyes=['SybrGld', 'DAPI', 'Cy5'],
+   )
+
+   # Lenient — runs every pair that exists, skips the rest:
+   results = e2m.run_batch(
+       samples=['CD070', 'CD063', 'CD055'],
+       dyes=['SybrGld', 'DAPI', 'Cy5'],
+       strict_dyes=False,
+   )
+
+Either way, fatal layout problems with the raw directory itself
+(missing, empty, no per-sample subfolders) raise
+:class:`FileNotFoundError` regardless of ``strict_dyes`` — there
+are no pairs to run at all in those cases.
 
 Parallel mode gotchas
 ~~~~~~~~~~~~~~~~~~~~~
@@ -183,6 +223,49 @@ interpreter, so:
   of thumb is ``workers × peak RAM per sample < total RAM``.
 - For small batches (1-3 samples) the spawn overhead often makes
   serial faster than parallel.
+- On low-RAM machines, prefer ``parallel=False`` over
+  ``parallel=True, n_workers=1``. Serial mode runs explicit
+  garbage-collection between tasks; single-worker parallel mode
+  does not. See :doc:`../users/memory_and_performance` for full
+  guidance.
+
+Discovery helpers
+-----------------
+
+If you want to do your own filtering before calling
+:func:`~exo2micro.run_batch`, two utility functions in
+:mod:`exo2micro.utils` are useful:
+
+:func:`~exo2micro.diagnose_raw_layout` returns a structured report
+about the layout of a raw directory — whether it exists, whether
+it has per-sample subfolders, whether those subfolders contain
+TIFFs. Use it for a fast pre-flight check before any real work::
+
+   from exo2micro import diagnose_raw_layout
+   report = diagnose_raw_layout('raw')
+   if not report['ok']:
+       print(report['message'])
+   else:
+       print(f"Found {len(report['subdirs'])} sample folder(s)")
+
+:func:`~exo2micro.discover_tasks` resolves a ``samples × dyes``
+request against the filesystem and returns three lists::
+
+   from exo2micro import discover_tasks
+   result = discover_tasks(
+       samples=['CD070', 'CD063'],
+       dyes=['SybrGld', 'DAPI', 'Cy5'],
+       raw_dir='raw',
+   )
+   print('Will run:', result['present'])
+   for sample, dye, reason in result['skipped']:
+       print(f'  skip {sample}/{dye}: {reason}')
+   for sample, warning in result['warnings']:
+       print(f'  warning in {sample}: {warning}')
+
+This is the same helper :func:`~exo2micro.run_batch` and the GUI
+use internally; calling it yourself lets you inspect the resolution
+before any tasks run.
 
 Working with output files
 -------------------------

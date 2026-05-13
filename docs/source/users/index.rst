@@ -17,4 +17,5 @@ things don't look right.
    scale_methods
    interpreting_results
    zoom_and_inspect
+   memory_and_performance
    troubleshooting

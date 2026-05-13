@@ -570,8 +570,13 @@ class SampleDye:
         self._generate_alignment_plots(
             post_full, pre_aligned, pre_coarse, debug_data)
 
+        # debug_data carries several downsampled image arrays used only
+        # by _generate_alignment_plots above. Drop them now so they don't
+        # sit in self._results for the rest of the run.
+        self._results.pop('debug_data', None)
+
         # Release images (but keep pre_pad if stage 3 needs it)
-        del post_pad, post_full, pre_aligned, pre_coarse
+        del post_pad, post_full, pre_aligned, pre_coarse, debug_data
 
     def _run_stage_3_fine(self, force=False):
         """Stage 3: Interior ECC refinement."""
@@ -800,6 +805,14 @@ class SampleDye:
                 post_full, pre_aligned, float(manual_scale_param),
                 label='manual',
                 force=force)
+
+        # Drop transient cross-stage state. By the time stage 4 finishes,
+        # the warp matrices and ECC bookkeeping from stages 2 and 3 are
+        # no longer needed; only the small scalar scale estimates need
+        # to survive into the return dict from run().
+        for key in ('warp_matrix', 'warp_matrix_interior',
+                    'interior_ecc_result', 'pre_pad', 'debug_data'):
+            self._results.pop(key, None)
 
         del post_full, pre_aligned
 

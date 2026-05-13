@@ -29,6 +29,17 @@ Image.MAX_IMAGE_PIXELS = None
 # FILE I/O
 # ==============================================================================
 
+def _is_tiff(filename):
+    """Return True if ``filename`` ends with ``.tif`` or ``.tiff`` (case-insensitive).
+
+    Used by :func:`classify_raw_files`, :func:`survey_raw_channels`, and
+    :func:`diagnose_raw_layout` so all three apply the same rule. Add new
+    extensions or tweak the rule here in one place.
+    """
+    lower = filename.lower()
+    return lower.endswith('.tif') or lower.endswith('.tiff')
+
+
 def survey_raw_channels(raw_dir='raw', crop_size=1000):
     """
     Survey all raw TIFF files to report which RGB channels carry signal.
@@ -49,12 +60,36 @@ def survey_raw_channels(raw_dir='raw', crop_size=1000):
         One entry per file with keys: 'path', 'size', 'mode', 'channels'.
         'channels' is a dict mapping channel name ('R', 'G', 'B' or
         'gray') to {'max': int, 'mean': float, 'nonzero': int}.
+
+    Notes
+    -----
+    If ``raw_dir`` is missing, empty, or has TIFFs in the wrong place
+    (e.g. directly in ``raw_dir`` rather than in per-sample
+    subdirectories), this function prints a human-readable layout
+    diagnosis via :func:`diagnose_raw_layout` and returns an empty list.
     """
-    pattern = os.path.join(raw_dir, '**', '*.tif')
-    files = sorted(glob.glob(pattern, recursive=True))
+    # Catch the common layout problems up front and explain them in
+    # plain English. If the layout is fine, this is silent.
+    layout = diagnose_raw_layout(raw_dir)
+    if not layout['ok']:
+        print(layout['message'])
+        return []
+
+    # Walk the tree case-insensitively for both .tif and .tiff. The
+    # previous glob ``**/*.tif`` was both case-sensitive on Linux/Mac
+    # and missed .tiff files entirely.
+    files = []
+    for root, _dirs, names in os.walk(raw_dir):
+        for name in names:
+            if _is_tiff(name):
+                files.append(os.path.join(root, name))
+    files = sorted(files)
 
     if not files:
-        print(f"  No .tif files found in {raw_dir}")
+        # diagnose_raw_layout already covers the no-files case, but
+        # keep a fallback for the (rare) case where the layout looked
+        # ok but the recursive walk found nothing.
+        print(f"  No .tif/.tiff files found under {raw_dir}")
         return []
 
     results = []
@@ -238,8 +273,7 @@ def classify_raw_files(sample_dir):
 
     candidates = []
     for entry in os.listdir(sample_dir):
-        lower = entry.lower()
-        if lower.endswith('.tif') or lower.endswith('.tiff'):
+        if _is_tiff(entry):
             candidates.append(os.path.join(sample_dir, entry))
 
     pairs = {}
@@ -286,12 +320,328 @@ def classify_raw_files(sample_dir):
         if not dye:
             warnings.append(
                 f"EMPTY DYE: {basename} has nothing between the last "
-                f"underscore and the extension.")
+                f"underscore and the extension. The filename must end "
+                f"with '_<DyeName>.tif' or '_<DyeName>.tiff', where the "
+                f"dye name (e.g. SybrGld, DAPI, Cy5) contains no "
+                f"underscores.")
             continue
 
         pairs.setdefault(dye, {'pre': [], 'post': []})[kind].append(path)
 
     return pairs, warnings
+
+
+def diagnose_raw_layout(raw_dir='raw'):
+    """
+    Diagnose the layout of a raw image directory and return a structured report.
+
+    Catches the common "I don't see any images" failure modes before the
+    pipeline gets a chance to fail confusingly downstream:
+
+    1. ``raw_dir`` doesn't exist at all.
+    2. ``raw_dir`` exists but is empty.
+    3. ``raw_dir`` contains TIFF files directly (no per-sample folders).
+       This is the most common mistake — users dump all their files in
+       one place instead of separating by sample.
+    4. ``raw_dir`` contains subdirectories but none of them contain any
+       TIFF files.
+
+    When the layout looks correct, returns ``ok=True`` and a short
+    informational summary. When something is wrong, returns ``ok=False``
+    and a multi-line ``message`` explaining what's wrong and how the
+    directory should be structured.
+
+    Parameters
+    ----------
+    raw_dir : str
+        Path to the raw image directory (default ``'raw'``).
+
+    Returns
+    -------
+    report : dict
+        Keys:
+
+        - ``ok`` (bool): True if the layout looks usable.
+        - ``message`` (str): Human-readable multi-line message. Empty
+          string when ``ok=True`` and there's nothing to report.
+        - ``raw_dir`` (str): The directory that was inspected.
+        - ``exists`` (bool): Whether ``raw_dir`` itself exists.
+        - ``subdirs`` (list of str): Subdirectory names found (sorted).
+        - ``loose_tiffs`` (list of str): TIFF filenames found directly
+          in ``raw_dir`` (sorted). Non-empty implies the layout is
+          wrong even if ``subdirs`` is also non-empty.
+        - ``empty_subdirs`` (list of str): Subdirectory names that
+          contain no TIFF files (sorted). Informational only.
+    """
+    report = {
+        'ok': False,
+        'message': '',
+        'raw_dir': raw_dir,
+        'exists': False,
+        'subdirs': [],
+        'loose_tiffs': [],
+        'empty_subdirs': [],
+    }
+
+    # The "canonical layout" string used in several error messages.
+    # Reuses the rules from classify_raw_files; if either changes,
+    # update both together.
+    layout_hint = (
+        "Expected layout:\n"
+        "    {raw_dir}/\n"
+        "      Sample001/\n"
+        "        Sample001_PreStain_SybrGld.tif\n"
+        "        Sample001_PostStain_SybrGld.tif\n"
+        "      Sample002/\n"
+        "        Sample002_PreStain_DAPI.tif\n"
+        "        Sample002_PostStain_DAPI.tif\n\n"
+        "Filename rules:\n"
+        "  1. Each sample must live in its OWN subdirectory under {raw_dir}.\n"
+        "  2. Files end with .tif or .tiff (case-insensitive).\n"
+        "  3. Filename contains 'pre' or 'post' (case-insensitive)\n"
+        "     somewhere in the basename.\n"
+        "  4. Filename ends with '_<DyeName>.tif' (or .tiff). The dye\n"
+        "     name MUST NOT contain underscores. Use 'SybrGld', 'DAPI',\n"
+        "     'Cy5', etc. — not 'SybrGld_microbe'.\n"
+        "  5. Each sample directory contains exactly one pre-stain and\n"
+        "     one post-stain file per dye."
+    ).format(raw_dir=raw_dir)
+
+    # Case 1: raw_dir doesn't exist
+    if not os.path.exists(raw_dir):
+        report['message'] = (
+            f"Raw image directory not found: '{raw_dir}'\n"
+            f"  -> exo2micro looked for this directory in your current "
+            f"working directory and didn't find it.\n"
+            f"  -> Either create it and put your sample folders inside, "
+            f"or point the GUI / SampleDye / run_batch at the directory "
+            f"where your raw images actually live (raw_dir='...').\n\n"
+            f"{layout_hint}"
+        )
+        return report
+
+    if not os.path.isdir(raw_dir):
+        report['message'] = (
+            f"'{raw_dir}' exists but is not a directory.\n"
+            f"  -> exo2micro needs raw_dir to be a folder containing "
+            f"per-sample subfolders.\n\n"
+            f"{layout_hint}"
+        )
+        return report
+
+    report['exists'] = True
+
+    # Inventory the immediate children of raw_dir
+    entries = [e for e in os.listdir(raw_dir) if not e.startswith('.')]
+    loose_tiffs = sorted([e for e in entries if _is_tiff(e)])
+    subdirs = sorted([
+        e for e in entries
+        if os.path.isdir(os.path.join(raw_dir, e))
+    ])
+    report['subdirs'] = subdirs
+    report['loose_tiffs'] = loose_tiffs
+
+    # Case 2: empty raw_dir
+    if not entries:
+        report['message'] = (
+            f"Raw image directory is empty: '{raw_dir}'\n"
+            f"  -> exo2micro needs this directory to contain one folder "
+            f"per sample, with paired pre-stain and post-stain TIFFs "
+            f"inside each folder.\n\n"
+            f"{layout_hint}"
+        )
+        return report
+
+    # Case 3: TIFFs are directly in raw_dir (no per-sample folders)
+    if loose_tiffs and not subdirs:
+        # Show up to 5 example filenames so the user can recognize their
+        # files and not be confused about which directory is meant.
+        examples = loose_tiffs[:5]
+        more = (f"\n     ... and {len(loose_tiffs) - 5} more"
+                if len(loose_tiffs) > 5 else "")
+        report['message'] = (
+            f"Found {len(loose_tiffs)} TIFF file(s) directly inside "
+            f"'{raw_dir}', but no per-sample subfolders.\n"
+            f"  -> exo2micro requires each sample to live in its own "
+            f"subdirectory under '{raw_dir}'. The current layout puts "
+            f"all images in one folder, which exo2micro doesn't know "
+            f"how to interpret.\n"
+            f"  -> Found these files:\n"
+            f"     " + "\n     ".join(examples) + more + "\n"
+            f"  -> Fix: create a folder per sample (e.g. '{raw_dir}/Sample001/'),\n"
+            f"     and move each sample's pre/post files into its folder.\n\n"
+            f"{layout_hint}"
+        )
+        return report
+
+    # Mixed case: loose TIFFs AND subdirectories. Probably a mistake.
+    if loose_tiffs and subdirs:
+        examples = loose_tiffs[:5]
+        more = (f" (and {len(loose_tiffs) - 5} more)"
+                if len(loose_tiffs) > 5 else "")
+        report['message'] = (
+            f"Found {len(loose_tiffs)} TIFF file(s) directly inside "
+            f"'{raw_dir}' (alongside {len(subdirs)} subdirectory(ies)).\n"
+            f"  -> exo2micro only reads images from per-sample "
+            f"subdirectories. The loose files at the top level will be "
+            f"ignored:\n"
+            f"     " + ", ".join(examples) + more + "\n"
+            f"  -> If those files belong to one of the existing samples, "
+            f"move them into the appropriate subfolder. If they're a new "
+            f"sample, create a folder for them.\n\n"
+            f"{layout_hint}"
+        )
+        # This is recoverable — the existing subdirs may still process —
+        # so we report it as a warning, not a fatal error.
+        report['ok'] = True
+        # Check whether the subdirs themselves have any usable images
+        # before claiming the layout is OK.
+        # (fall through to the subdir-check block below)
+
+    # Case 4: subdirectories exist but none contain TIFFs
+    empty_subdirs = []
+    nonempty_subdirs = []
+    for sub in subdirs:
+        sub_path = os.path.join(raw_dir, sub)
+        try:
+            sub_entries = os.listdir(sub_path)
+        except OSError:
+            empty_subdirs.append(sub)
+            continue
+        has_tiff = any(_is_tiff(e) for e in sub_entries)
+        if has_tiff:
+            nonempty_subdirs.append(sub)
+        else:
+            empty_subdirs.append(sub)
+    report['empty_subdirs'] = empty_subdirs
+
+    if subdirs and not nonempty_subdirs:
+        report['message'] = (
+            f"Found {len(subdirs)} sample subdirectory(ies) under "
+            f"'{raw_dir}', but none of them contain any TIFF files.\n"
+            f"  -> exo2micro found these folders:\n"
+            f"     " + ", ".join(subdirs[:10])
+            + ("..." if len(subdirs) > 10 else "") + "\n"
+            f"  -> Each one should contain at least one pre-stain TIFF "
+            f"and one post-stain TIFF.\n\n"
+            f"{layout_hint}"
+        )
+        report['ok'] = False
+        return report
+
+    # All good (possibly with the mixed-loose-and-subdirs warning above)
+    if not report['message']:
+        # Pure-success path: build an informational summary, leave ok=True.
+        summary_parts = [
+            f"raw_dir='{raw_dir}': {len(nonempty_subdirs)} "
+            f"sample folder(s) with TIFFs"
+        ]
+        if empty_subdirs:
+            summary_parts.append(
+                f", {len(empty_subdirs)} empty folder(s) ignored")
+        report['message'] = ''.join(summary_parts)
+    report['ok'] = True
+    return report
+
+
+def discover_tasks(samples, dyes, raw_dir='raw'):
+    """
+    Resolve a (samples, dyes) request into the actual list of tasks present on disk.
+
+    Given a list of sample names and a list of dye names the user wants
+    to process, walk each sample directory and return:
+
+    - ``present``: list of ``(sample, dye)`` tuples that have both a
+      pre-stain and a post-stain file. These are runnable.
+    - ``skipped``: list of ``(sample, dye, reason)`` tuples that were
+      requested but can't run, with a short human-readable reason.
+    - ``warnings``: list of ``(sample, warning_str)`` tuples for
+      filename problems encountered along the way (ambiguous, no
+      underscore, etc. — same wording as :func:`classify_raw_files`
+      returns).
+
+    This is the canonical "what tasks should we actually run?" helper.
+    Both the batch processor (:func:`exo2micro.parallel.build_task_list`)
+    and the GUI use it so they share one source of truth.
+
+    Parameters
+    ----------
+    samples : list of str
+        Sample names requested by the user.
+    dyes : list of str
+        Dye names requested by the user.
+    raw_dir : str
+        Root directory containing per-sample subdirectories (default
+        ``'raw'``).
+
+    Returns
+    -------
+    result : dict
+        Keys: ``present`` (list of (sample, dye)), ``skipped`` (list of
+        (sample, dye, reason)), ``warnings`` (list of (sample,
+        warning_str)), and ``layout_ok`` (bool — False if
+        :func:`diagnose_raw_layout` flagged a fatal layout problem; in
+        that case ``present`` and ``skipped`` will both be empty and
+        a single layout warning is added to ``warnings``).
+    """
+    result = {
+        'present': [],
+        'skipped': [],
+        'warnings': [],
+        'layout_ok': True,
+    }
+
+    # Top-level layout check first. If raw_dir is missing or shaped
+    # wrong, there's no point even trying to resolve individual pairs.
+    layout = diagnose_raw_layout(raw_dir)
+    if not layout['ok']:
+        result['layout_ok'] = False
+        result['warnings'].append(('(layout)', layout['message']))
+        return result
+
+    for sample in samples:
+        sample_dir = os.path.join(raw_dir, sample)
+        if not os.path.isdir(sample_dir):
+            for dye in dyes:
+                result['skipped'].append(
+                    (sample, dye,
+                     f"sample directory '{sample_dir}' does not exist"))
+            continue
+
+        pairs, file_warnings = classify_raw_files(sample_dir)
+        for w in file_warnings:
+            result['warnings'].append((sample, w))
+
+        for dye in dyes:
+            if dye not in pairs:
+                available = sorted(pairs.keys())
+                if available:
+                    reason = (f"no '{dye}' files in this sample "
+                              f"(dyes present: {', '.join(available)})")
+                else:
+                    reason = (f"no validly-named raw files in "
+                              f"'{sample_dir}'")
+                result['skipped'].append((sample, dye, reason))
+                continue
+
+            pre_n = len(pairs[dye]['pre'])
+            post_n = len(pairs[dye]['post'])
+            if pre_n == 0 or post_n == 0:
+                missing_side = 'pre-stain' if pre_n == 0 else 'post-stain'
+                reason = (f"incomplete pair — {missing_side} file is "
+                          f"missing (found {pre_n} pre, {post_n} post)")
+                result['skipped'].append((sample, dye, reason))
+                continue
+
+            if pre_n > 1 or post_n > 1:
+                reason = (f"duplicate files — found {pre_n} pre and "
+                          f"{post_n} post for this dye, expected 1+1")
+                result['skipped'].append((sample, dye, reason))
+                continue
+
+            result['present'].append((sample, dye))
+
+    return result
 
 
 def estimate_pipeline_output_size(sample_dye_pairs, raw_dir='raw',
@@ -692,6 +1042,17 @@ def load_image_pair(sample, dye, raw_dir='raw'):
             msg += f"\n  -> dyes detected in this directory: {available}"
         else:
             msg += f"\n  -> no validly-named raw files in this directory"
+        if '_' in dye:
+            # Most common typo: user passed 'SybrGld_microbe' as the dye
+            # name when the actual file is named with just 'SybrGld' as
+            # the dye and 'microbe' is a leftover descriptor. Dye names
+            # must not contain underscores.
+            msg += (f"\n  -> note: dye names must not contain underscores. "
+                    f"The dye is the substring AFTER the last underscore "
+                    f"in the filename. If your files are named like "
+                    f"'..._{dye}.tif', the dye here would be "
+                    f"'{dye.rsplit('_', 1)[1]}'. Either rename the files "
+                    f"or request the dye as '{dye.rsplit('_', 1)[1]}'.")
         raise FileNotFoundError(msg)
 
     pre_files = pairs[dye]['pre']

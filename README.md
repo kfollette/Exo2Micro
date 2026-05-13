@@ -4,7 +4,7 @@
 
 exo2micro takes paired pre-stain and post-stain fluorescence images of mineral samples, aligns them, estimates the autofluorescent background scale factor, and subtracts it to reveal microbe-only signal.
 
-Version 2.3.
+Version 2.3.1.
 
 ---
 
@@ -130,6 +130,22 @@ results = e2m.run_batch(
 )
 ```
 
+By default `run_batch` is strict: if any requested `(sample, dye)` pair has no raw files on disk, it raises `FileNotFoundError` listing every missing pair so you can catch typos before a long batch starts. If your samples are heterogeneous (not every dye exists for every sample), pass `strict_dyes=False` to skip missing pairs silently and run only the present ones:
+
+```python
+results = e2m.run_batch(
+    samples=['CD070', 'CD063'],
+    dyes=['SybrGld', 'DAPI', 'Cy5'],
+    strict_dyes=False,
+)
+```
+
+The GUI handles this for you: it shows missing pairs in a confirmation banner with a "Run the present pairs anyway" button, plus muted gray tiles for every pair that got filtered out.
+
+### Memory and parallel mode
+
+If your computer has limited RAM (8 GB or less), or your images are very large, leave `parallel=False` (the default). Serial mode actively clears each sample out of memory before starting the next one, so you can process big batches without running out of RAM. Parallel mode is faster when you have memory to spare, but each worker holds its own copy of the current sample's images — 4 workers means 4× the memory use. See [Memory and Performance](https://exo2micro.readthedocs.io/en/latest/users/memory_and_performance.html) for guidance on sizing `n_workers`.
+
 ---
 
 ## How It Works
@@ -251,6 +267,8 @@ Or just read the `.rst` files directly — they're readable as plain text.
 ---
 
 ## Upgrading
+
+**From 2.3.0 → 2.3.1.** One behaviour change for batch scripts: `run_batch` now defaults to `strict_dyes=True`, which raises `FileNotFoundError` if any requested `(sample, dye)` pair has no raw files. If you were relying on missing pairs failing one-by-one as task-level errors, either fix your sample/dye lists or pass `strict_dyes=False`. See `CHANGELOG.md` for the full list of 2.3.1 changes.
 
 If you're upgrading from v2.2 or earlier, see `docs/source/migration.rst` for the full list of breaking changes. Key points:
 

@@ -12,9 +12,11 @@ Includes:
   - Display helpers (robust vmax, RGB overlays)
 """
 
+import gc
 import os
 import sys
 import glob
+from typing import Optional
 import numpy as np
 import cv2
 from PIL import Image
@@ -1701,3 +1703,101 @@ def estimate_gauss_sigma(im, down_scale, sparse_threshold=0.1,
         print(f"estimate_gauss_sigma: dense  (nonzero={nonzero_fraction:.3f}) "
               f"— using sigma={sigma}")
     return sigma
+
+
+# ==============================================================================
+# MEMORY DIAGNOSTICS
+# ==============================================================================
+
+def _get_psutil():
+    """Import psutil lazily so it's an optional dependency."""
+    try:
+        import psutil
+        return psutil
+    except ImportError:
+        return None
+
+
+class MemoryTracker:
+    """
+    Track resident-set-size (RSS) across pipeline tasks.
+
+    Use this to confirm whether memory is actually being released between
+    tasks in a batch. If RSS climbs monotonically across tasks, there is a
+    leak somewhere (matplotlib figures, Jupyter ``Out[]`` history, retained
+    widget state, unfreed numpy temporaries). If RSS returns to baseline
+    after the explicit ``gc.collect()`` in each task footer, then per-task
+    peak is just exceeding available RAM and the answer is reducing
+    ``pad``, using a smaller working resolution, or switching to
+    subprocess-per-task mode (see
+    :func:`exo2micro.parallel.run_batch_subprocess`).
+
+    When ``enabled=False`` (the default) all methods are cheap no-ops, so
+    leaving the calls in production code costs essentially nothing.
+
+    Requires ``psutil`` to actually do anything. If psutil is missing the
+    tracker prints a one-time warning and no-ops.
+
+    Example
+    -------
+    >>> from exo2micro.utils import MemoryTracker
+    >>> tracker = MemoryTracker(enabled=True)
+    >>> tracker.snapshot('start')
+    >>> for sample, dye in tasks:
+    ...     tracker.snapshot(f'before {sample}/{dye}')
+    ...     SampleDye(sample, dye).run()
+    ...     tracker.collect_and_snapshot(f'after gc {sample}/{dye}')
+    >>> tracker.summary()
+    """
+
+    def __init__(self, enabled=False):
+        self.enabled = enabled
+        self._psutil = _get_psutil() if enabled else None
+        self._process = (self._psutil.Process(os.getpid())
+                         if self._psutil else None)
+        self._history = []  # list of (label, rss_gb)
+
+        if enabled and self._psutil is None:
+            print("[MemoryTracker] psutil not installed; tracking disabled. "
+                  "`pip install psutil` to enable.")
+
+    def _rss_gb(self):
+        if self._process is None:
+            return None
+        return self._process.memory_info().rss / 1e9
+
+    def snapshot(self, label):
+        """Record current RSS with a label and print it."""
+        if not self.enabled or self._process is None:
+            return
+        rss = self._rss_gb()
+        self._history.append((label, rss))
+        print(f"[mem] {rss:6.2f} GB  {label}")
+
+    def collect_and_snapshot(self, label):
+        """Run ``gc.collect()`` twice then snapshot. Use between tasks."""
+        if not self.enabled or self._process is None:
+            return
+        # Two passes — the first frees cycles, the second sweeps anything
+        # that finalizers freed during the first.
+        gc.collect()
+        gc.collect()
+        self.snapshot(label)
+
+    def summary(self):
+        """Print a summary table at end of batch."""
+        if not self.enabled or not self._history:
+            return
+        baseline = self._history[0][1]
+        peak = max(rss for _, rss in self._history)
+        final = self._history[-1][1]
+        print("\n[mem] === memory summary ===")
+        print(f"[mem] baseline: {baseline:6.2f} GB")
+        print(f"[mem] peak:     {peak:6.2f} GB  (+{peak - baseline:.2f} GB)")
+        print(f"[mem] final:    {final:6.2f} GB  (+{final - baseline:.2f} GB)")
+        if final - baseline > 0.5:
+            print("[mem] WARNING: final RSS is >0.5 GB above baseline. "
+                  "This suggests a leak rather than just high peak usage. "
+                  "Consider switching to subprocess-per-task mode "
+                  "(exo2micro.parallel.run_batch_subprocess).")
+        print("[mem] ======================\n")

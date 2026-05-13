@@ -54,9 +54,12 @@ adjust based on observed memory usage.
 """
 
 import gc
+import json
 import os
+import subprocess
+import sys
 from .pipeline import SampleDye
-from .utils import discover_tasks
+from .utils import discover_tasks, MemoryTracker
 
 
 def process_one(args):
@@ -162,7 +165,7 @@ def build_task_list(pairs, params=None,
             for sample, dye in pairs]
 
 
-def run_serial(tasks):
+def run_serial(tasks, tracker=None):
     """
     Run all tasks sequentially in the current process.
 
@@ -177,6 +180,10 @@ def run_serial(tasks):
     tasks : list of tuple
         Each tuple is ``(sample, dye, params_dict)``, as built by
         :func:`build_task_list`.
+    tracker : MemoryTracker or None
+        Optional memory tracker. When provided, snapshots RSS before
+        and after each task (with a gc.collect() pass between them) so
+        leaks can be diagnosed. ``None`` (default) means no tracking.
 
     Returns
     -------
@@ -193,6 +200,9 @@ def run_serial(tasks):
 
     results = []
     for args in tasks:
+        sample, dye, _ = args
+        if tracker is not None:
+            tracker.snapshot(f"before {sample}/{dye}")
         results.append(process_one(args))
         # Per-task memory release. Matplotlib's pyplot module retains
         # references to all open figures even after they're saved to
@@ -201,7 +211,10 @@ def run_serial(tasks):
         # the reference counter alone wouldn't free immediately.
         if have_plt:
             plt.close('all')
-        gc.collect()
+        if tracker is not None:
+            tracker.collect_and_snapshot(f"after gc {sample}/{dye}")
+        else:
+            gc.collect()
     return results
 
 
@@ -232,10 +245,208 @@ def run_parallel(tasks, n_workers=4):
     return results
 
 
+# ==============================================================================
+# SUBPROCESS-PER-TASK RUNNER
+# ==============================================================================
+#
+# Motivation: even in serial mode, some matplotlib / cv2 / tifffile state
+# and Jupyter Out[] references can accumulate across tasks. The only fully
+# reliable cure for accumulated leaks is to run each task in a fresh Python
+# process and let the OS reclaim everything when the process exits.
+#
+# This is DIFFERENT from `parallel=True, n_workers=1`, which uses a
+# multiprocessing.Pool that keeps the same worker process alive across all
+# tasks (so leaks accumulate just as they would in serial mode).
+# Subprocess-per-task spawns a NEW process for EACH task and tears it down
+# after.
+#
+# Cost: ~1-2 sec spawn + module-import overhead per task. For batches of
+# large samples (alignment runtime in minutes) this is negligible. The
+# tradeoff is worth it on any machine where serial mode is OOMing.
+# ==============================================================================
+
+# Child-process script. Kept as a string (rather than a module-level
+# function called via multiprocessing) so the subprocess is a clean,
+# debuggable one-shot invocation — you can copy the printed command and
+# re-run it manually to reproduce a failure.
+_SUBPROCESS_CHILD_SCRIPT = """
+import json, sys, traceback
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import exo2micro as e2m
+    args = json.loads(sys.argv[1])
+    sample = args['sample']
+    dye = args['dye']
+    params = args['params'] or {}
+    output_dir = params.pop('output_dir', 'processed')
+    raw_dir = params.pop('raw_dir', 'raw')
+    from_stage = params.pop('from_stage', None)
+    to_stage = params.pop('to_stage', None)
+    force = params.pop('force', False)
+    checkpoint_format = params.pop('checkpoint_format', 'tiff')
+    run = e2m.SampleDye(sample, dye, output_dir=output_dir,
+                        raw_dir=raw_dir,
+                        checkpoint_format=checkpoint_format)
+    if params:
+        run.set_params(**params)
+    result = run.run(from_stage=from_stage, to_stage=to_stage, force=force)
+    print('__EXO2MICRO_RESULT__' + json.dumps(result))
+except Exception as e:
+    traceback.print_exc()
+    try:
+        a = json.loads(sys.argv[1])
+        sample, dye = a.get('sample'), a.get('dye')
+    except Exception:
+        sample, dye = None, None
+    err = {'sample': sample, 'dye': dye, 'status': 'error: ' + str(e)}
+    print('__EXO2MICRO_RESULT__' + json.dumps(err))
+    sys.exit(1)
+"""
+
+
+def _run_one_subprocess(task, timeout=None):
+    """
+    Run a single ``(sample, dye, params)`` task in a fresh subprocess.
+
+    Returns a result dict matching :meth:`SampleDye.run`'s contract.
+    On subprocess failure (crash, OOM kill, timeout, segfault in a C
+    extension) returns a dict with ``status`` starting with
+    ``'error: '`` so the caller can keep going.
+
+    Parameters
+    ----------
+    task : tuple
+        ``(sample, dye, params_dict)`` as produced by
+        :func:`build_task_list`.
+    timeout : float or None
+        Maximum seconds for the subprocess. None = no timeout.
+    """
+    sample, dye, params = task
+    payload = json.dumps({
+        'sample': sample,
+        'dye': dye,
+        'params': params,
+    })
+
+    try:
+        proc = subprocess.run(
+            [sys.executable, '-c', _SUBPROCESS_CHILD_SCRIPT, payload],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return {'sample': sample, 'dye': dye,
+                'status': f'error: subprocess timed out after {timeout}s'}
+    except Exception as e:
+        return {'sample': sample, 'dye': dye,
+                'status': f'error: subprocess launch failed: {e}'}
+
+    # Echo child stdout to the parent so the user sees progress
+    # messages, then pluck out the result marker line.
+    result = None
+    for line in proc.stdout.splitlines():
+        if line.startswith('__EXO2MICRO_RESULT__'):
+            try:
+                result = json.loads(line[len('__EXO2MICRO_RESULT__'):])
+            except Exception as e:
+                print(f"[subprocess] could not parse result line: {e}")
+        else:
+            print(line)
+    if proc.stderr:
+        print(proc.stderr, file=sys.stderr)
+
+    if result is None:
+        # Process exited with no result marker — almost certainly an
+        # OOM kill (SIGKILL on Linux/Mac leaves no traceback) or a
+        # segfault in a C extension. Return code 137 == 128 + 9 == SIGKILL.
+        if proc.returncode in (-9, 137):
+            status = 'error: subprocess killed (likely OOM)'
+        elif proc.returncode < 0:
+            status = f'error: subprocess killed by signal {-proc.returncode}'
+        else:
+            status = (f'error: subprocess exited {proc.returncode} '
+                      f'with no result')
+        return {'sample': sample, 'dye': dye, 'status': status}
+
+    return result
+
+
+def run_subprocess(tasks, memory_debug=False, timeout_per_task=None):
+    """
+    Run all tasks, each in its own fresh Python subprocess.
+
+    Use this on low-RAM machines where serial mode runs OOM partway
+    through a batch. Each task gets a clean process, so any leaked
+    matplotlib figures / numpy arrays / cv2 caches are reclaimed by
+    the OS when the process exits between tasks.
+
+    Parameters
+    ----------
+    tasks : list of tuple
+        Each tuple is ``(sample, dye, params_dict)``, as built by
+        :func:`build_task_list`.
+    memory_debug : bool
+        If True, prints RSS in the parent process before and after
+        each task. Useful for confirming the OS is actually reclaiming
+        memory between tasks. Requires ``psutil``. Default ``False``.
+    timeout_per_task : float or None
+        Maximum seconds for any single task. ``None`` (default) means
+        no timeout. Recommended to set this for unattended overnight
+        batches so a wedged task doesn't block the whole run.
+
+    Returns
+    -------
+    list of dict
+        Results for each task. Failed tasks have ``status`` starting
+        with ``'error: '`` rather than raising.
+
+    Notes
+    -----
+    A few seconds of overhead per task for subprocess launch + import.
+    On a batch of large samples (alignment runtime measured in
+    minutes) this is invisible. On a batch of small/fast tasks this
+    overhead may dominate — use plain :func:`run_serial` in that
+    case.
+    """
+    tracker = MemoryTracker(enabled=memory_debug)
+    if memory_debug:
+        tracker.snapshot("batch start")
+
+    print(f"Starting subprocess run: {len(tasks)} task(s), one process per task")
+
+    results = []
+    for i, task in enumerate(tasks, 1):
+        sample, dye, _ = task
+        print(f"\n[{i}/{len(tasks)}] {sample}/{dye} (subprocess)")
+        if memory_debug:
+            tracker.snapshot(f"before {sample}/{dye}")
+
+        result = _run_one_subprocess(task, timeout=timeout_per_task)
+        results.append(result)
+
+        if memory_debug:
+            # No explicit gc.collect() here — the child process exiting
+            # already returned every byte to the OS. The snapshot
+            # just confirms that.
+            tracker.snapshot(f"after  {sample}/{dye}")
+
+        status = result.get('status', '')
+        if 'error' in str(status):
+            print(f"  ! {status}")
+
+    if memory_debug:
+        tracker.summary()
+
+    return results
+
+
 def run_batch(samples, dyes, parallel=False, n_workers=4,
               params=None, output_dir='processed', raw_dir='raw',
               from_stage=None, to_stage=None, force=False,
-              checkpoint_format='tiff', strict_dyes=True):
+              checkpoint_format='tiff', strict_dyes=True,
+              memory_debug=False, timeout_per_task=None):
     """
     High-level batch processing entry point.
 
@@ -256,20 +467,42 @@ def run_batch(samples, dyes, parallel=False, n_workers=4,
     - ``strict_dyes=False``: missing pairs are skipped silently (their
       reasons are printed in the batch summary, not raised).
 
+    Execution modes
+    ---------------
+    Three modes, controlled by the ``parallel`` argument:
+
+    - ``parallel=False`` (default) — **serial in current process**.
+      One task at a time, with explicit matplotlib figure cleanup and
+      ``gc.collect()`` between tasks. Safe on low-RAM machines for
+      moderate batch sizes.
+    - ``parallel=True`` — **process pool** of ``n_workers``. Multiple
+      tasks run concurrently. Fastest when you have CPU and RAM to
+      spare; can OOM on low-RAM machines.
+    - ``parallel='subprocess'`` — **subprocess per task**. One fresh
+      Python process per task, exited and reclaimed by the OS
+      between tasks. Use when serial mode is OOMing on a low-RAM
+      machine due to leaks (matplotlib figures, retained widget
+      state, accumulated cv2/tifffile caches) that ``gc.collect()``
+      can't reach. Adds ~1-2 sec per-task spawn overhead;
+      negligible for large samples.
+
     Parameters
     ----------
     samples : list of str
         Sample names.
     dyes : list of str
         Dye/channel names.
-    parallel : bool
-        Use multiprocessing (default ``False``). For small batches
-        serial is usually faster due to spawn overhead. On low-RAM
-        machines prefer ``parallel=False`` over ``parallel=True,
-        n_workers=1`` — the serial loop releases memory more
-        aggressively between tasks.
+    parallel : bool or str
+        ``False`` (default) for serial in-process. ``True`` for a
+        process pool. ``'subprocess'`` for one fresh subprocess per
+        task. For small batches serial is usually faster than parallel
+        due to spawn overhead. On low-RAM machines, prefer
+        ``parallel=False`` over ``parallel=True, n_workers=1`` — the
+        serial loop releases memory more aggressively between tasks.
+        If serial is still OOMing, try ``parallel='subprocess'``.
     n_workers : int
-        Number of workers when ``parallel=True`` (default 4).
+        Number of workers when ``parallel=True`` (default 4). Ignored
+        for the other two modes.
     params : dict or None
         Pipeline parameters applied to every task.
     output_dir : str
@@ -292,6 +525,18 @@ def run_batch(samples, dyes, parallel=False, n_workers=4,
         requested ``(sample, dye)`` pair has no raw files on disk.
         Set to False to skip such pairs silently and run only the
         present ones.
+    memory_debug : bool
+        If True, prints RSS before/after each task (with gc.collect()
+        between) so leaks can be diagnosed. Requires ``psutil``.
+        Useful for triaging "kernel dies mid-batch" reports. Default
+        ``False``. Only effective in serial and subprocess modes;
+        the parallel pool path ignores it (each worker is in its
+        own process, so per-task RSS in the parent isn't meaningful).
+    timeout_per_task : float or None
+        Only used when ``parallel='subprocess'``. Maximum seconds for
+        any single task; ``None`` (default) means no timeout.
+        Recommended for unattended overnight batches so a wedged
+        task doesn't block the whole run.
 
     Returns
     -------
@@ -361,10 +606,25 @@ def run_batch(samples, dyes, parallel=False, n_workers=4,
                             from_stage, to_stage, force,
                             checkpoint_format=checkpoint_format)
 
-    if parallel:
+    # Dispatch by execution mode.
+    # `parallel` accepts: False (serial), True (process pool),
+    # or the string 'subprocess' (one fresh process per task).
+    if parallel == 'subprocess':
+        results = run_subprocess(tasks, memory_debug=memory_debug,
+                                 timeout_per_task=timeout_per_task)
+    elif parallel:
+        if memory_debug:
+            print("[mem] memory_debug ignored in pool mode (RSS in "
+                  "parent is not meaningful when workers are in "
+                  "separate processes).")
         results = run_parallel(tasks, n_workers)
     else:
-        results = run_serial(tasks)
+        tracker = MemoryTracker(enabled=memory_debug)
+        if memory_debug:
+            tracker.snapshot("batch start")
+        results = run_serial(tasks, tracker=tracker if memory_debug else None)
+        if memory_debug:
+            tracker.summary()
 
     print_summary(results)
     return results

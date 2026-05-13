@@ -69,13 +69,13 @@ legacy     : Deprecated / superseded functions retained for back-compat.
              helpers formerly in ``scaling.py``.
 """
 
-__version__ = '2.3.1'
+__version__ = '2.4.0'
 
 # Primary API: the SampleDye pipeline class
 from .pipeline import SampleDye
 
 # Batch processing
-from .parallel import run_batch, run_serial, run_parallel
+from .parallel import run_batch, run_serial, run_parallel, run_subprocess
 
 # Commonly used functions re-exported for convenience
 from .alignment import register_highorder, prealign_phase_correlation
@@ -85,8 +85,13 @@ from .utils import (
     diagnose_raw_layout,
     discover_tasks,
     estimate_pipeline_output_size,
+    estimate_pipeline_memory,
     get_free_disk_space,
+    get_available_memory,
     format_bytes,
+    preflight_check,
+    MemoryTracker,
+    MemoryWatchdog,
     get_run_log_path,
     append_to_run_log,
     read_run_log_tail,

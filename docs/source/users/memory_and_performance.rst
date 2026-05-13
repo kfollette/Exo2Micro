@@ -120,6 +120,200 @@ Already-completed tasks are preserved when you abort. The pipeline
 saves checkpoints after each stage of each task, so re-running
 will pick up where you left off rather than starting over.
 
+Pre-flight resource checks (new in 2.4)
+---------------------------------------
+
+Starting in 2.4, both :func:`~exo2micro.run_batch` and
+:meth:`SampleDye.run` run a quick resource check before any task
+starts. The check reads only the raw TIFF *headers* (no pixel
+data, fast even on networked drives), estimates the peak RAM and
+total disk output your batch will produce, and compares each to
+the available headroom on the machine.
+
+Three severity levels per resource:
+
+- **≤ 80% of available — silent.** Run proceeds normally.
+- **80%-100% — warning, run proceeds.** A "⚠️ HIGH" line is
+  printed; you should consider closing other applications or
+  reducing ``n_workers`` but the run continues.
+- **> 100% — hard fail.** :class:`MemoryError` (for RAM) or
+  :class:`OSError` (for disk) is raised before any task runs.
+  The error message includes a remediation list with concrete
+  suggestions (reduce ``n_workers``, reduce ``pad``, switch
+  ``checkpoint_format`` to one format only, free disk, etc.) with
+  your current values inline.
+
+A typical successful check looks like this::
+
+   === Pre-flight resource check ===
+     RAM: estimated peak 2.8 GB vs 16.0 GB available (17%)  ✓
+     Disk: estimated total 4.1 GB vs 412 GB free (1%)  ✓
+   =================================
+
+This catches the case that previously caused most "kernel dies
+mid-batch" reports: starting an 8-worker batch on a 32 GB machine
+that needs 6 GB per task. Before 2.4, you'd see the kernel die
+with no useful diagnostic. In 2.4, the same configuration raises
+``MemoryError`` immediately with a message telling you exactly
+how many workers your machine can handle and why.
+
+Overriding the check
+~~~~~~~~~~~~~~~~~~~~
+
+If you know the estimate is conservative for your specific data —
+for example you've cleared other applications since the estimate
+was computed, or your samples are unusually compressible — pass
+``force_run=True`` to downgrade the hard fail to a warning::
+
+   results = e2m.run_batch(
+       samples=['CD070', 'CD063'],
+       dyes=['SybrGld'],
+       n_workers=8,
+       force_run=True,
+   )
+
+This is not recommended for normal use. If a run that's flagged
+``❌ EXCEEDS AVAILABLE`` actually does OOM-kill the Python
+process mid-batch, you may end up with corrupted checkpoint
+files (a half-written TIFF that the next run can't read), so the
+default behavior is to refuse the run rather than risk that.
+
+The 6× factor
+~~~~~~~~~~~~~
+
+The RAM estimate is::
+
+   peak per task ≈ (H + 2·pad) × (W + 2·pad) × 4 bytes × 6
+
+The 6× factor reflects how many full-resolution float32 image
+copies coexist at the worst point of a single task (stage 2 or
+stage 3, where padded post + padded pre + downsampled working
+copies + warp output buffer + SIFT internals all live in memory
+simultaneously). It's a conservative estimate. If you find the
+check is consistently refusing batches that actually fit on your
+machine, the constant ``PEAK_FACTOR_PER_TASK`` at the top of the
+memory-diagnostics section in ``exo2micro/utils.py`` can be
+tuned. We expect most users won't need to touch it.
+
+Subprocess mode for low-RAM machines (new in 2.4)
+-------------------------------------------------
+
+Even in serial mode, some memory can accumulate across tasks
+that ``gc.collect()`` between tasks can't fully reclaim:
+matplotlib figure state held by the pyplot module, Jupyter
+``Out[]`` cell references, cv2/tifffile internal caches. If
+you're seeing your collaborator's kernel die partway through a
+serial batch even though the pre-flight check passed, the cause
+is likely one of these slow accumulating leaks.
+
+The fix is **subprocess mode**: run each task in a fresh Python
+subprocess, exited and reclaimed by the OS between tasks.
+
+::
+
+   results = e2m.run_batch(
+       samples=['CD070', 'CD063'],
+       dyes=['SybrGld', 'DAPI'],
+       parallel='subprocess',
+   )
+
+This is a third value for the ``parallel`` argument, alongside
+``False`` (serial in-process, the default) and ``True``
+(multiprocessing pool). Each task runs in a fresh process. Tasks
+run one at a time (not concurrently — for that, use
+``parallel=True``).
+
+When to use subprocess mode:
+
+- Your pre-flight check passes (per-task RAM fits) but the
+  kernel still dies after a few tasks complete successfully.
+- The :class:`~exo2micro.MemoryTracker` summary (below) shows
+  RSS climbing monotonically across tasks.
+- You want overnight unattended batches to be robust to wedged
+  tasks (see ``timeout_per_task`` below).
+
+Important: subprocess mode is **not** the same as
+``parallel=True, n_workers=1``. That uses
+:class:`multiprocessing.Pool`, which keeps a single worker
+process alive across every task, so leaks accumulate in it just
+as they do in serial mode. Subprocess mode spawns a new process
+*per task* and tears it down after.
+
+Subprocess mode adds ~1-2 seconds of process-spawn overhead per
+task. For typical exo2micro tasks that take minutes to align,
+this is invisible.
+
+Timeouts and OOM detection
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+In subprocess mode you can also set ``timeout_per_task`` to
+abort any task that runs too long::
+
+   results = e2m.run_batch(
+       samples=samples,
+       dyes=dyes,
+       parallel='subprocess',
+       timeout_per_task=1800,   # 30 minutes per task
+   )
+
+Recommended for unattended overnight batches so a wedged task
+doesn't block the rest.
+
+If a subprocess gets killed by the OS (most often SIGKILL from
+the kernel's OOM killer), the parent detects this and records
+the task as ``'error: subprocess killed (likely OOM)'`` rather
+than crashing the batch. The remaining tasks continue normally.
+
+Diagnosing memory issues (new in 2.4)
+-------------------------------------
+
+If you've hit a memory problem and you're not sure whether it's
+a per-task peak overrun or an accumulating leak, the
+:class:`~exo2micro.MemoryTracker` class can tell you. Pass
+``memory_debug=True`` to :func:`run_batch`::
+
+   results = e2m.run_batch(
+       samples=['CD070', 'CD063'],
+       dyes=['SybrGld', 'DAPI'],
+       memory_debug=True,
+   )
+
+This prints RSS (resident set size) snapshots before and after
+each task, with an explicit ``gc.collect()`` pass in between::
+
+   [mem]   2.34 GB  batch start
+   [mem]   2.34 GB  before CD070/SybrGld
+   [mem]   8.91 GB  after gc CD070/SybrGld
+   [mem]   8.91 GB  before CD070/DAPI
+   [mem]  14.22 GB  after gc CD070/DAPI
+   [mem]  14.22 GB  before CD063/SybrGld
+   ...
+   [mem] === memory summary ===
+   [mem] baseline:   2.34 GB
+   [mem] peak:      14.22 GB  (+11.88 GB)
+   [mem] final:     14.22 GB  (+11.88 GB)
+   [mem] WARNING: final RSS is >0.5 GB above baseline. ...
+
+The pattern of those numbers tells you which problem you have:
+
+- **RSS climbs monotonically and never returns to baseline** →
+  real leak. ``gc.collect()`` isn't recovering memory between
+  tasks. Use subprocess mode (above) — that's the only reliable
+  cure.
+- **RSS spikes during each task but returns to baseline between
+  them** → no leak. Per-task peak just exceeds your RAM. Reduce
+  ``n_workers``, reduce ``pad``, or close other applications.
+
+The pre-flight check tries to predict the second case before any
+task runs, but the tracker is what you want when you've gotten
+past pre-flight and still have problems. Requires the optional
+``psutil`` dependency::
+
+   pip install psutil
+
+Without psutil, ``memory_debug=True`` no-ops with a one-time
+warning.
+
 What exo2micro does on its own to manage memory
 -----------------------------------------------
 

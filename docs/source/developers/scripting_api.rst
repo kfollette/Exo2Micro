@@ -229,6 +229,89 @@ interpreter, so:
   does not. See :doc:`../users/memory_and_performance` for full
   guidance.
 
+Subprocess mode (new in 2.4)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A third value for ``parallel``, alongside ``False`` and ``True``::
+
+   results = e2m.run_batch(
+       samples=['CD070', 'CD063'],
+       dyes=['SybrGld', 'DAPI'],
+       parallel='subprocess',
+       timeout_per_task=1800,   # optional: 30-minute per-task timeout
+   )
+
+Each task runs in a fresh Python subprocess that exits and is
+reclaimed by the OS before the next one starts. Tasks run one at
+a time (not concurrently). Adds ~1-2 seconds of process-spawn
+overhead per task; negligible for typical multi-minute alignment
+runs.
+
+Use subprocess mode when serial mode is killing your kernel
+partway through a batch even though each individual task fits.
+This indicates an accumulating memory leak that ``gc.collect()``
+can't reach (matplotlib, retained Jupyter state, cv2/tifffile
+caches); subprocess mode is the reliable cure.
+
+Distinct from ``parallel=True, n_workers=1``: that uses a Pool
+that keeps the worker alive across tasks, so leaks accumulate.
+Subprocess mode kills the worker after every task.
+
+If a subprocess gets killed by the OS (SIGKILL, OOM, segfault in
+a C extension), the parent detects this and records the failed
+task with ``status='error: subprocess killed (likely OOM)'``
+rather than crashing the batch. The remaining tasks continue.
+
+Pre-flight resource checks (new in 2.4)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Both :func:`run_batch` and :meth:`SampleDye.run` run a pre-flight
+RAM + disk check before any task starts. The check reads only the
+raw TIFF *headers* (no pixel data) to estimate per-task peak RAM
+and total disk output, then compares each to available headroom.
+
+Three severity bands per resource:
+
+- ≤ 80% — silent pass.
+- 80%-100% — warning printed, run proceeds.
+- > 100% — :class:`MemoryError` (RAM) or :class:`OSError` (disk)
+  raised before any task runs.
+
+The hard-fail error messages include a remediation list with
+your current values inline. See
+:doc:`../users/memory_and_performance` for full details.
+
+To override the hard fail and proceed anyway::
+
+   results = e2m.run_batch(
+       samples=samples, dyes=dyes,
+       force_run=True,    # downgrades hard fails to warnings
+   )
+
+Not recommended unless you know the estimate is wrong for your
+data. A run that actually does OOM-kill mid-batch may leave a
+corrupt checkpoint file behind that the next run can't read.
+
+Memory debugging
+~~~~~~~~~~~~~~~~
+
+Pass ``memory_debug=True`` to enable RSS tracking across tasks.
+This wires :class:`~exo2micro.MemoryTracker` into the serial and
+subprocess paths and prints memory snapshots before and after
+each task::
+
+   results = e2m.run_batch(
+       samples=samples, dyes=dyes,
+       memory_debug=True,
+   )
+
+Requires the optional ``psutil`` dependency. Ignored in
+``parallel=True`` (pool) mode because workers are in their own
+processes and the parent's RSS isn't meaningful.
+
+See :doc:`../users/memory_and_performance` for how to read the
+output.
+
 Discovery helpers
 -----------------
 
@@ -266,6 +349,95 @@ request against the filesystem and returns three lists::
 This is the same helper :func:`~exo2micro.run_batch` and the GUI
 use internally; calling it yourself lets you inspect the resolution
 before any tasks run.
+
+Resource estimation
+-------------------
+
+For programmatic access to the pre-flight check machinery (e.g.
+deciding whether to run a batch from a wrapper script), three
+utility functions in :mod:`exo2micro.utils` are exposed in v2.4:
+
+:func:`~exo2micro.estimate_pipeline_memory` returns a per-task and
+concurrent-peak RAM estimate based on TIFF-header reads only (no
+pixel data loaded). Cheap enough to call frequently::
+
+   from exo2micro import estimate_pipeline_memory
+   est = estimate_pipeline_memory(
+       sample_dye_pairs=[('CD070', 'SybrGld'), ('CD063', 'DAPI')],
+       raw_dir='raw',
+       pad=2000,
+       n_workers=4,
+   )
+   print(f"Peak per task: {est['peak_bytes'] / 1e9:.1f} GB")
+   print(f"Concurrent peak: {est['concurrent_peak_bytes'] / 1e9:.1f} GB")
+
+:func:`~exo2micro.estimate_pipeline_output_size` (in
+v2.3) returns a disk-output estimate. The two together cover the
+inputs to :func:`~exo2micro.preflight_check`, which combines them
+with available-RAM and free-disk lookups and prints the standard
+three-band severity summary::
+
+   from exo2micro import preflight_check
+   preflight_check(
+       sample_dye_pairs=[('CD070', 'SybrGld')],
+       output_dir='processed',
+       raw_dir='raw',
+       pad=2000,
+       n_workers=1,
+       checkpoint_format='tiff',
+   )
+
+Will raise :class:`MemoryError` or :class:`OSError` on hard fail,
+unless ``force_run=True`` is passed. This is what
+:func:`run_batch` and :meth:`SampleDye.run` call internally.
+
+Memory diagnostics
+------------------
+
+Two utilities for runtime memory observation (v2.4, optional
+``psutil`` dependency).
+
+:class:`~exo2micro.MemoryTracker` records resident-set-size
+across labelled snapshots and prints a summary at the end. Used
+internally when you pass ``memory_debug=True`` to
+:func:`run_batch`, but you can also drive it directly::
+
+   from exo2micro import MemoryTracker
+   tracker = MemoryTracker(enabled=True)
+   tracker.snapshot('start')
+   for sample, dye in pairs:
+       tracker.snapshot(f'before {sample}/{dye}')
+       e2m.SampleDye(sample, dye).run()
+       tracker.collect_and_snapshot(f'after gc {sample}/{dye}')
+   tracker.summary()
+
+The collect_and_snapshot variant runs ``gc.collect()`` before
+recording RSS. Useful for distinguishing real leaks (RSS doesn't
+drop after gc) from transient peaks (RSS does drop).
+
+:class:`~exo2micro.MemoryWatchdog` polls available RAM from a
+background thread and raises :class:`MemoryError` when it crosses
+a threshold. Use when you want a single batch to abort cleanly
+near the RAM ceiling rather than getting OOM-killed by the OS::
+
+   from exo2micro import MemoryWatchdog
+   wd = MemoryWatchdog(min_available_gb=0.5)
+   wd.start()
+   try:
+       for sample, dye in pairs:
+           wd.check_or_raise(f'before {sample}/{dye}')
+           e2m.SampleDye(sample, dye).run()
+   finally:
+       wd.stop()
+
+The watchdog itself doesn't interrupt anything mid-allocation — it
+just sets a flag. The caller polls :meth:`check_or_raise` at safe
+abort points (typically between tasks or stages) to actually halt.
+
+Not auto-wired into :class:`SampleDye` or :func:`run_batch`. The
+pre-flight check above is usually sufficient; the watchdog is for
+edge cases where memory usage grows gradually across many stages
+within a single task.
 
 Working with output files
 -------------------------

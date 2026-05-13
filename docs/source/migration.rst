@@ -4,6 +4,91 @@ Migration Guide
 This page consolidates upgrade notes for moving between exo2micro
 versions. Start with your current version and walk forward.
 
+From 2.3 to 2.4
+---------------
+
+Pipeline behavior is unchanged at defaults. Most existing scripts
+will run identically after the upgrade. There are two new
+behaviors that *can* change what happens, both governed by an
+opt-out flag:
+
+Pre-flight resource checks
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Both :func:`~exo2micro.run_batch` and :meth:`SampleDye.run` now
+estimate peak RAM and total disk output from raw TIFF headers
+before any task runs, and raise :class:`MemoryError` or
+:class:`OSError` if the estimate exceeds available headroom.
+
+For most existing scripts on machines that previously ran
+successfully, this is silent: the check passes and the run
+proceeds. The change affects two categories of script:
+
+- **Scripts that always ran on machines with comfortable RAM
+  headroom** — no change visible.
+- **Scripts that occasionally tipped a low-RAM machine into
+  swap-thrashing or OOM-kill** — those scripts now raise
+  ``MemoryError`` immediately rather than failing later with a
+  dead kernel and no traceback. The error message includes a
+  remediation list with the current values of ``n_workers``,
+  ``pad``, etc. so you can see what to change.
+
+To restore the pre-2.4 behavior of "just try it"::
+
+   results = e2m.run_batch(..., force_run=True)
+   # or
+   run.run(force_run=True)
+
+This downgrades the hard fail to a warning. Not recommended for
+routine use; a run that actually OOM-kills mid-batch can leave a
+corrupt checkpoint file that the next run can't read. See
+:doc:`users/memory_and_performance` for full details.
+
+The pre/post histogram plot
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+:func:`plot_pre_post_histograms` (stage 4 output
+``pre_post_histograms.png``) has been rewritten to give an
+apples-to-apples comparison between the discrete-valued post
+image and a now-also-discrete raw pre image. The previous
+version overlaid the post against the bilinearly-interpolated
+warped pre, which produced misleading shape differences.
+
+Three changes in the saved PNG:
+
+- The pre-stain foreground histogram is now the **raw padded
+  pre** (discrete 8-bit) rather than the warped pre
+  (continuous float).
+- The warped pre is still shown, but as a faint grey background
+  reference.
+- The y-axis switches to log automatically when the zero bin
+  dominates (more than 5× the next-tallest bin). Linear y
+  remains the default.
+
+If you've been calling :func:`plot_pre_post_histograms` directly
+from your own scripts with only ``post_im`` and ``pre_im``
+arguments, the function falls back to the previous two-curve
+layout for backward compatibility. To get the new three-curve
+layout, pass ``raw_pre_im=`` as well (this is what stage 4 does
+internally now).
+
+Recommended new features
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+- If your collaborator's kernel dies partway through batches,
+  try ``parallel='subprocess'`` mode in :func:`run_batch`. Each
+  task gets a fresh Python process; the OS reclaims memory
+  between tasks reliably. See
+  :doc:`users/memory_and_performance`.
+- For unattended overnight batches, set
+  ``timeout_per_task=1800`` (or similar) so a wedged task
+  doesn't block the rest of the run.
+- For diagnosing intermittent memory problems, pass
+  ``memory_debug=True`` to :func:`run_batch`. Prints RSS
+  snapshots between tasks so you can tell whether you have a
+  leak (RSS climbs) or just an oversize task (RSS spikes and
+  recovers). Requires the optional ``psutil`` dependency.
+
 From 2.2 to 2.3
 ---------------
 

@@ -65,6 +65,129 @@ sets ``strict_dyes=False`` for that run. Missing pairs render as
 muted gray tiles with a "(no files)" label so you can see what was
 filtered out at a glance.
 
+"Estimated peak RAM exceeds available RAM"
+------------------------------------------
+
+Starting in v2.4, :func:`~exo2micro.run_batch` and
+:meth:`SampleDye.run` run a pre-flight resource check before any
+task starts. When the estimated peak RAM for your batch exceeds
+the available memory on the machine, the run raises
+:class:`MemoryError` immediately with a multi-line message::
+
+   MemoryError: Estimated peak RAM (24.0 GB) exceeds available RAM (16.0 GB).
+     - 12 task(s), 4 concurrent worker(s), pad=2000.
+     - Per-task peak estimate uses a 6.0x factor over single-image float32 size.
+   Options:
+     1. Reduce n_workers (currently 4).
+     2. Reduce pad (currently 2000; try 1000 or 500).
+     3. Close other applications to free RAM.
+     4. Use parallel='subprocess' mode if leaks are suspected.
+     5. Override this check with force_run=True (NOT recommended; will likely OOM-kill the kernel).
+
+Pick the remedy that fits your situation:
+
+- **Working alone on the machine, just want it to finish** — lower
+  ``n_workers`` until the estimate fits. Start by halving and
+  iterate.
+- **Images larger than you remembered** — reduce ``pad`` from
+  2000 to 1000 or 500. The estimate is dominated by ``(H +
+  2·pad) × (W + 2·pad)``, so cutting pad in half significantly
+  reduces peak.
+- **You know the estimate is wrong for your data** — pass
+  ``force_run=True``. Not recommended for routine use; see
+  :doc:`memory_and_performance` for why.
+
+See :doc:`memory_and_performance` for the full pre-flight
+discussion and how to tune the per-task RAM estimate if needed.
+
+"Estimated output size exceeds free disk space"
+-----------------------------------------------
+
+The disk side of the pre-flight check raises :class:`OSError`
+when the estimated total output won't fit at ``output_dir``::
+
+   OSError: Estimated output size (180.0 GB) exceeds free disk space (95.0 GB) at processed/.
+     - 47 task(s).
+     - checkpoint_format='both' (switch to 'tiff' or 'fits' alone to roughly halve).
+   Options:
+     1. Free up disk space at processed/.
+     2. Switch checkpoint_format to 'tiff' or 'fits' (not 'both').
+     3. Run a smaller subset of samples/dyes.
+     4. Override this check with force_run=True.
+
+The most common cause is ``checkpoint_format='both'`` — every
+intermediate is written twice. Switching to ``'tiff'`` alone (or
+``'fits'`` alone) roughly halves the output footprint.
+
+"Subprocess killed (likely OOM)"
+--------------------------------
+
+In subprocess mode (``parallel='subprocess'``), if a task's
+subprocess gets killed by the operating system rather than
+exiting cleanly, the parent records the task as::
+
+   error: subprocess killed (likely OOM)
+
+The most common cause is the OS OOM killer (SIGKILL, return
+code 137 on Linux/macOS). The subprocess hit the system's RAM
+limit and was terminated to protect the rest of the system.
+
+This shouldn't normally happen if the pre-flight check passed,
+but it can happen if:
+
+- The estimate was too optimistic for this particular sample
+  (an unusual image with extreme dimensions, for example).
+- Another process on the machine grew during the run and
+  consumed the RAM the pre-flight check thought was available.
+- The 6× per-task multiplier was too low — see
+  :doc:`memory_and_performance`.
+
+The remaining tasks in the batch continue normally. To recover:
+
+1. Look at the summary for which tasks failed and which succeeded.
+2. Rerun just the failed tasks, with a smaller ``pad`` or a
+   different machine.
+3. If many tasks failed the same way, the pre-flight estimate
+   needs tuning for your data — see the discussion of the 6×
+   factor in :doc:`memory_and_performance`.
+
+"Kernel dies mid-batch" or "kernel restarts during run"
+-------------------------------------------------------
+
+Symptoms: Jupyter or JupyterLab reports the kernel has died
+or been restarted partway through a batch, with no useful
+Python traceback. The pre-flight check passed and individual
+tasks were processing cleanly, but at some point the whole
+process disappeared.
+
+The most common cause is one of two things:
+
+- **Accumulating memory leak** across tasks. Per-task usage looks
+  fine, but each task leaves a bit of memory behind that
+  ``gc.collect()`` can't reach. After many tasks, the cumulative
+  leak crosses the system's RAM ceiling and the OS kills the
+  kernel.
+- **Per-task peak occasionally spikes** above the estimate for
+  unusual samples in an otherwise normal batch.
+
+To distinguish them, enable :class:`MemoryTracker` by passing
+``memory_debug=True`` to :func:`run_batch`::
+
+   results = e2m.run_batch(
+       samples=samples, dyes=dyes,
+       memory_debug=True,
+   )
+
+Then watch the printed RSS values across tasks. If RSS climbs
+monotonically and never returns to baseline, you have a leak —
+switch to subprocess mode (``parallel='subprocess'``), which
+runs each task in a fresh process the OS reclaims after.
+
+If RSS spikes per task but returns to baseline between them,
+peak usage is the problem — reduce ``pad`` or ``n_workers``.
+
+See :doc:`memory_and_performance` for the full diagnosis flow.
+
 Alignment doesn't look right
 ----------------------------
 

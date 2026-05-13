@@ -1827,7 +1827,7 @@ class MemoryTracker:
 # differently.
 # ==============================================================================
 
-PEAK_FACTOR_PER_TASK = 6.0
+PEAK_FACTOR_PER_TASK = 4.0
 WARN_FRACTION = 0.80   # warn if estimate exceeds this fraction of available
 HARD_FAIL_FRACTION = 1.0  # raise if estimate exceeds this fraction
 

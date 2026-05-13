@@ -3,9 +3,12 @@
 
 project = 'exo2micro'
 copyright = '2026'
-author = 'exo2micro contributors'
-release = '2.3.0'
-version = '2.3'
+author = 'Kate Follette'
+release = '2.4.0'
+version = '2.4'
+
+html_logo = "Exo2Micro_logo.png"
+html_favicon = "Exo2Micro_logo.png"
 
 extensions = [
     'sphinx.ext.autodoc',

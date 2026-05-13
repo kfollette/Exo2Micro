@@ -1,4 +1,8 @@
-# 🔬 exo2micro
+# Exoplanets to Microbes (Exo2Micro) Pipeline
+
+<p align="center">
+  <img src="docs/source/Exo2Micro_logo.png" alt="Exo2Micro logo" width="200">
+</p>
 
 **exo2micro** is an image registration and fluorescence subtraction
 pipeline for pre/post-stain microscopy. It has been designed to process paired pre-stain and post-stain microscopy images by (a) aligning the images using an iterative process that allows for translation, rotation, shear, and magnification differences between pre- and post- stain images, (b) estimating the autofluorescent mineral background signal, and (c) optimally subtracting pre- from post-stain images to reveal microbe-only signal. The software is still in active development. 

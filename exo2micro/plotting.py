@@ -630,18 +630,48 @@ def plot_excess_heatmap(post_im, pre_im, scale=None, scales=None,
     return fig
 
 def plot_pre_post_histograms(post_im, pre_im,
+                             raw_pre_im=None,
                              sample='', dye='', save_path=None):
     """
     Overlapping histograms of pre-stain and post-stain pixel values.
 
-    Uses ALL pixels.  Bin edges are integer-aligned (-0.5, 0.5, …)
-    so each integer value sits at the centre of its bin.  Log y-axis
-    to show both the peak and the tails.
+    Apples-to-apples comparison: when ``raw_pre_im`` is provided, the
+    foreground pre histogram uses the **raw padded pre-stain image**
+    (discrete 8-bit values, no warp interpolation), making it directly
+    comparable to the post histogram which is also discrete 8-bit.
+    The warped/interpolated pre is drawn underneath in faint grey
+    for reference so the effect of the alignment warp on the
+    distribution is still visible.
+
+    Padding-region zeros (where both pre and post are 0) are excluded
+    via a sample-region mask defined as ``(post > 0) | (pre > 0)``.
+    Interior dark pixels (zero in the sample region) are retained.
+
+    Bin edges are integer-aligned (-0.5, 0.5, …) and adapt to the
+    actual range and density of observed values to avoid empty bins
+    when the data are sparse.
+
+    The y-axis is linear by default; if the zero-value bin is more
+    than 5× taller than the next-tallest bin (a common situation
+    when the sample has lots of interior dark pixels), the y-axis
+    switches to log so the rest of the distribution remains visible.
 
     Parameters
     ----------
-    post_im, pre_im : ndarray (2-D, float-like)
-        Post-stain and aligned pre-stain images.
+    post_im : ndarray (2-D, float-like)
+        Post-stain image (the reference frame, always
+        ``01_padded_post``).
+    pre_im : ndarray (2-D, float-like)
+        Aligned (warped, interpolated) pre-stain image
+        (``03_interior_aligned_pre`` or ``02_icp_aligned_pre``).
+        Plotted in faint grey as a background reference.
+    raw_pre_im : ndarray (2-D, float-like) or None
+        Raw padded pre-stain image (``01_padded_pre``) — discrete
+        8-bit values, no warp interpolation. When provided this is
+        the apples-to-apples comparison to the post histogram and
+        is plotted in the foreground. When ``None`` (legacy
+        callers), the function falls back to the previous two-curve
+        behaviour: warped pre and post only.
     sample, dye : str
         For title.
     save_path : str or None
@@ -651,31 +681,146 @@ def plot_pre_post_histograms(post_im, pre_im,
     -------
     fig : matplotlib.Figure
     """
-    post = post_im.ravel().astype(np.float64)
-    pre = pre_im.ravel().astype(np.float64)
+    # Sample-region mask: anywhere any of the three images has signal
+    # is "in the sample". Anywhere all are zero is padding. This
+    # excludes padding from all distributions without throwing away
+    # interior dark pixels. ORing in the raw pre matters because it
+    # lives in a slightly different (unwarped) frame than post and
+    # warped pre — for large warps its sample footprint can extend
+    # beyond the post/warped sample mask, and we want to keep those
+    # pixels.
+    if raw_pre_im is not None:
+        sample_mask = (post_im > 0) | (pre_im > 0) | (raw_pre_im > 0)
+    else:
+        sample_mask = (post_im > 0) | (pre_im > 0)
+    post = post_im[sample_mask].astype(np.float64).ravel()
+    pre_warped = pre_im[sample_mask].astype(np.float64).ravel()
+    if raw_pre_im is not None:
+        raw_pre = raw_pre_im[sample_mask].astype(np.float64).ravel()
+    else:
+        raw_pre = None
 
-    hi = max(float(np.percentile(post, 99.9)),
-             float(np.percentile(pre, 99.9)))
-    max_int = int(np.ceil(hi))
-    edges = np.arange(-0.5, max_int + 1.5, 1.0)
+    # ── Adaptive bin edges ────────────────────────────────────────
+    # Use integer-aligned bins (each integer at the centre of its
+    # bin). Range is determined by the foreground data (post + raw
+    # pre if available, else post + warped pre). 99.9th percentile
+    # caps the upper edge so a few bright outliers don't waste 90%
+    # of the plot width.
+    if raw_pre is not None and len(raw_pre):
+        hi_data = np.concatenate([post, raw_pre])
+    else:
+        hi_data = np.concatenate([post, pre_warped])
+    if len(hi_data) == 0:
+        # Degenerate case: nothing to plot. Bail out with an empty
+        # figure rather than crashing.
+        fig, ax = plt.subplots(figsize=(9, 4))
+        ax.set_title(f'{_title_prefix(sample, dye)}'
+                     'pre vs post: no in-sample pixels')
+        if save_path:
+            fig.savefig(save_path, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+        return fig
+
+    lo = 0  # always start at 0 so interior dark pixels are visible
+    hi = max(1, int(np.ceil(np.percentile(hi_data, 99.9))))
+
+    # Sparsity check: count distinct integer values present in the
+    # foreground data over [lo, hi]. If they fill more than ~30% of
+    # the integer range, use one bin per integer. Otherwise use one
+    # bin per *observed* value — avoids long combs of empty bins
+    # when only a handful of brightnesses appear (e.g. heavily
+    # quantised raw data).
+    foreground_ints = np.unique(np.rint(hi_data[hi_data <= hi]).astype(np.int64))
+    foreground_ints = foreground_ints[foreground_ints >= lo]
+    span = hi - lo + 1
+    if len(foreground_ints) >= 0.30 * span:
+        # Dense — one bin per integer.
+        edges = np.arange(lo - 0.5, hi + 1.5, 1.0)
+        x_positions = np.arange(lo, hi + 1)
+    else:
+        # Sparse — one bin per observed value. Edges sit halfway
+        # between consecutive observed values so each bin centres
+        # on its value.
+        if len(foreground_ints) == 1:
+            v = foreground_ints[0]
+            edges = np.array([v - 0.5, v + 0.5])
+        else:
+            mids = (foreground_ints[:-1] + foreground_ints[1:]) / 2.0
+            edges = np.concatenate([
+                [foreground_ints[0] - 0.5],
+                mids,
+                [foreground_ints[-1] + 0.5],
+            ])
+        x_positions = foreground_ints
 
     prefix = _title_prefix(sample, dye)
     fig, ax = plt.subplots(figsize=(9, 4))
 
-    ax.hist(pre, bins=edges,
-            histtype='stepfilled', color='#2196a0', alpha=0.45,
-            edgecolor='#2196a0', linewidth=1.2,
-            label=f'pre-stain  (n={len(pre):,})')
-    ax.hist(post, bins=edges,
-            histtype='stepfilled', color='#e05c2a', alpha=0.45,
-            edgecolor='#e05c2a', linewidth=1.2,
-            label=f'post-stain  (n={len(post):,})')
+    # ── Background layer: warped (interpolated) pre, faint grey ──
+    # Drawn first so it sits beneath the foreground. We keep this
+    # so users can see how much the alignment warp smeared the
+    # distribution compared to the raw pre.
+    if raw_pre is not None:
+        ax.hist(pre_warped, bins=edges,
+                histtype='stepfilled', color='#888888', alpha=0.18,
+                edgecolor='#888888', linewidth=0.8,
+                label=f'pre-stain, warped  (n={len(pre_warped):,})',
+                zorder=1)
 
-    ax.set_yscale('log')
+    # ── Foreground: raw pre (or warped pre as fallback) and post ──
+    fg_pre = raw_pre if raw_pre is not None else pre_warped
+    fg_pre_label = ('pre-stain, raw' if raw_pre is not None
+                    else 'pre-stain')
+
+    pre_counts, _, _ = ax.hist(
+        fg_pre, bins=edges,
+        histtype='stepfilled', color='#2196a0', alpha=0.45,
+        edgecolor='#2196a0', linewidth=1.2,
+        label=f'{fg_pre_label}  (n={len(fg_pre):,})',
+        zorder=2)
+    post_counts, _, _ = ax.hist(
+        post, bins=edges,
+        histtype='stepfilled', color='#e05c2a', alpha=0.45,
+        edgecolor='#e05c2a', linewidth=1.2,
+        label=f'post-stain  (n={len(post):,})',
+        zorder=3)
+
+    # ── Decide y-scale ────────────────────────────────────────────
+    # If the zero bin is more than 10× taller than the second-tallest
+    # bin in either foreground distribution, switch to log y so the
+    # rest of the histogram doesn't get crushed to the baseline.
+    use_log = False
+    for counts in (pre_counts, post_counts):
+        if len(counts) < 2:
+            continue
+        # The zero bin is whichever bin contains value 0. With our
+        # integer-aligned edges that's the first bin if lo == 0.
+        zero_bin_idx = 0 if x_positions[0] == 0 else None
+        if zero_bin_idx is None:
+            continue
+        zero_count = counts[zero_bin_idx]
+        # Second-tallest = max over all non-zero bins.
+        others = np.concatenate([counts[:zero_bin_idx],
+                                 counts[zero_bin_idx + 1:]])
+        if len(others) == 0:
+            continue
+        second = others.max()
+        if second > 0 and zero_count > 5 * second:
+            use_log = True
+            break
+
+    if use_log:
+        ax.set_yscale('log')
+        y_label = 'pixel count (log)'
+    else:
+        y_label = 'pixel count'
+
+    ax.set_xlim(lo - 0.5, hi + 0.5)
     ax.set_xlabel('pixel brightness', fontsize=11)
-    ax.set_ylabel('pixel count', fontsize=10)
-    ax.set_title(f'{prefix}pre vs post pixel value distributions', fontsize=10)
-    ax.legend(fontsize=9)
+    ax.set_ylabel(y_label, fontsize=10)
+    ax.set_title(f'{prefix}pre vs post pixel value distributions',
+                 fontsize=10)
+    ax.legend(fontsize=9, loc='best')
 
     plt.tight_layout()
     if save_path:

@@ -722,11 +722,17 @@ class SampleDye:
                 save_path=heatmap_path)
 
         # Overlapping histograms: pre and post distributions
+        # Load the raw (unwarped) padded pre so the plot can show a
+        # discrete 8-bit pre histogram apples-to-apples with post,
+        # with the warped pre underneath in faint grey for reference.
         if force or not os.path.exists(hist_path):
+            raw_pre = self._load_image(1, 'pre')
             plotting.plot_pre_post_histograms(
                 post_full, pre_aligned,
+                raw_pre_im=raw_pre,
                 sample=self.sample, dye=self.dye,
                 save_path=hist_path)
+            del raw_pre
 
         # Difference histogram: post - pre (unscaled)
         if force or not os.path.exists(diff_hist_path):

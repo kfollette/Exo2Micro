@@ -1,8 +1,11 @@
 # 🔬 exo2micro
 
-**Image registration and fluorescence subtraction for pre/post-stain microscopy.**
+**exo2micro** is an image registration and fluorescence subtraction
+pipeline for pre/post-stain microscopy. It has been designed to process paired pre-stain and post-stain microscopy images by (a) aligning the images using an iterative process that allows for translation, rotation, shear, and magnification differences between pre- and post- stain images, (b) estimating the autofluorescent mineral background signal, and (c) optimally subtracting pre- from post-stain images to reveal microbe-only signal. The software is still in active development. 
 
-exo2micro takes paired pre-stain and post-stain fluorescence images of mineral samples, aligns them, estimates the autofluorescent background scale factor, and subtracts it to reveal microbe-only signal.
+This software was developed as a collaboration between the `Follette Lab at Amherst College <https://www.follettelab.com>`_, which specializes in astronomical image processing, especially of extrasolar planets and the `Marlow Lab at Boston University <https://www.marlowscience.com/>`_, which specializes in microscopy imaging of astrobiologically interesting terrestrial rock samples. Development of this software was supported by Heising-Simons Foundation grant \#2022-3992 issued as part of the `Scialog: Signatures of Life in the Universe <https://rescorp.org/scialog/signatures-of-life-in-the-universe/>`_ conference series. The software is named for the title of our original grant proposal: "Exoplanets to Microbes: Using Astronomical Image Processing Techniques to Detect Microbes in Astrobiological Contexts".
+
+The current software was written and is maintained by Kate Follette. Undergraduate researchers Giselle Hoermann, Kinsey Cronin, Jessica Laboissiere, Sarah Vierling, and Suyash Deshmukh contributed significantly to early versions of some of its functionalities. 
 
 Version 2.3.1.
 

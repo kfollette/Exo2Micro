@@ -1801,3 +1801,432 @@ class MemoryTracker:
                   "Consider switching to subprocess-per-task mode "
                   "(exo2micro.parallel.run_batch_subprocess).")
         print("[mem] ======================\n")
+
+
+# ==============================================================================
+# PRE-FLIGHT RESOURCE ESTIMATION (RAM + DISK)
+# ==============================================================================
+#
+# The goal of these helpers is to catch insufficient-RAM and insufficient-disk
+# situations BEFORE a long batch starts, rather than letting the kernel get
+# OOM-killed mid-run (which leaves no useful diagnostic) or running out of
+# disk halfway through writing a 4 GB float32 TIFF (which leaves a corrupt
+# checkpoint file).
+#
+# The disk side reuses estimate_pipeline_output_size + get_free_disk_space
+# above. The RAM side is below.
+#
+# RAM is estimated as:
+#   peak_per_task ≈ padded_pixel_count * 4 bytes * PEAK_FACTOR
+#
+# PEAK_FACTOR = 6 is an empirical estimate of how many full-resolution
+# float32 image copies live in memory simultaneously at the worst point of
+# a single-task run (stage 2 or stage 3, where padded post + padded pre +
+# downsampled working copies + warp output buffer + SIFT internals all
+# coexist). Adjust at the top of this section if real measurements show
+# differently.
+# ==============================================================================
+
+PEAK_FACTOR_PER_TASK = 6.0
+WARN_FRACTION = 0.80   # warn if estimate exceeds this fraction of available
+HARD_FAIL_FRACTION = 1.0  # raise if estimate exceeds this fraction
+
+
+def estimate_pipeline_memory(sample_dye_pairs, raw_dir='raw',
+                              pad=2000, n_workers=1):
+    """
+    Estimate peak RAM required to process a list of (sample, dye) pairs.
+
+    Reads only TIFF headers (no pixel data) to get raw image dimensions,
+    inflates by the padding, multiplies by float32 bytes/pixel and by
+    :data:`PEAK_FACTOR_PER_TASK` to account for the several full-resolution
+    arrays that coexist at peak. For parallel runs, multiplies by
+    ``n_workers``.
+
+    The estimate is the **worst-case peak across tasks**, not the sum,
+    because tasks run sequentially in serial mode (only one task in memory
+    at a time) and concurrently in parallel mode (n_workers tasks at a
+    time, but each could be the worst one).
+
+    Parameters
+    ----------
+    sample_dye_pairs : list of tuple
+        ``(sample, dye)`` combinations.
+    raw_dir : str
+        Root raw image directory.
+    pad : int
+        Padding parameter (default 2000). Larger padding inflates the
+        memory estimate substantially.
+    n_workers : int
+        Number of concurrent worker processes. ``1`` for serial.
+
+    Returns
+    -------
+    estimate : dict
+        Keys: ``peak_bytes`` (int, worst-case single-task peak),
+        ``concurrent_peak_bytes`` (int, that times n_workers),
+        ``per_task_bytes`` (list of int, one per pair),
+        ``warnings`` (list of str), and ``n_resolvable`` (int).
+    """
+    # Defer the tifffile import to keep utils.py importable for callers
+    # that don't need this estimate (e.g. on systems without tifffile).
+    try:
+        import tifffile
+    except ImportError:
+        return {
+            'peak_bytes': None,
+            'concurrent_peak_bytes': None,
+            'per_task_bytes': [],
+            'warnings': ['tifffile not available; cannot estimate RAM'],
+            'n_resolvable': 0,
+        }
+
+    per_task = []
+    warnings = []
+    for sample, dye in sample_dye_pairs:
+        sample_dir = os.path.join(raw_dir, sample)
+        pairs, _ = classify_raw_files(sample_dir)
+        if dye not in pairs or not pairs[dye]['pre'] or not pairs[dye]['post']:
+            warnings.append(
+                f"{sample} / {dye}: cannot resolve raw files for estimate")
+            per_task.append(0)
+            continue
+
+        # Read just the TIFF header — no pixel data. Use the post-stain
+        # file as the size reference; pre-stain dimensions are
+        # essentially identical in practice.
+        raw_path = pairs[dye]['post'][0]
+        try:
+            with tifffile.TiffFile(raw_path) as tf:
+                shape = tf.pages[0].shape
+        except Exception as e:
+            warnings.append(
+                f"{sample} / {dye}: cannot read TIFF header {raw_path}: {e}")
+            per_task.append(0)
+            continue
+
+        # shape is (H, W) for grayscale or (H, W, C) for RGB. We work
+        # in 2-D extracted-channel space, so use H * W regardless.
+        if len(shape) >= 2:
+            h, w = shape[0], shape[1]
+        else:
+            warnings.append(
+                f"{sample} / {dye}: unexpected TIFF shape {shape}")
+            per_task.append(0)
+            continue
+
+        padded_h = h + 2 * pad
+        padded_w = w + 2 * pad
+        bytes_per_image = padded_h * padded_w * 4  # float32
+
+        task_peak = int(bytes_per_image * PEAK_FACTOR_PER_TASK)
+        per_task.append(task_peak)
+
+    if per_task and any(b > 0 for b in per_task):
+        peak = max(b for b in per_task if b > 0)
+    else:
+        peak = 0
+
+    concurrent_peak = peak * max(1, n_workers)
+
+    return {
+        'peak_bytes': peak,
+        'concurrent_peak_bytes': concurrent_peak,
+        'per_task_bytes': per_task,
+        'warnings': warnings,
+        'n_resolvable': sum(1 for b in per_task if b > 0),
+    }
+
+
+def get_available_memory():
+    """Return available RAM in bytes, or None if psutil unavailable."""
+    psutil = _get_psutil()
+    if psutil is None:
+        return None
+    return psutil.virtual_memory().available
+
+
+def preflight_check(sample_dye_pairs, output_dir='processed', raw_dir='raw',
+                     pad=2000, n_workers=1,
+                     checkpoint_format='tiff', n_scale_methods=1,
+                     save_all_intermediates=False, force_run=False):
+    """
+    Combined RAM + disk pre-flight check before a batch or single run.
+
+    Estimates both peak RAM (across all concurrent tasks) and total disk
+    output. Compares each against the available headroom on the system
+    and either warns or raises :class:`MemoryError` / :class:`OSError`
+    depending on severity.
+
+    Severity bands (each resource checked independently):
+
+    - estimate ≤ 80% of available — silent.
+    - 80%-100% — print a warning, proceed.
+    - > 100% — raise ``MemoryError`` (RAM) or ``OSError`` (disk).
+
+    Callers can pass ``force_run=True`` to downgrade the hard fail to a
+    warning. Useful when the estimate is known to be conservative or
+    when the user has already cleared other processes.
+
+    Parameters
+    ----------
+    sample_dye_pairs : list of tuple
+        Tasks to check.
+    output_dir : str
+        Where checkpoints will be written. Free disk space is measured
+        at this path.
+    raw_dir : str
+        Source raw images, needed to read TIFF dimensions.
+    pad : int
+        Padding parameter.
+    n_workers : int
+        Concurrent workers. ``1`` for serial.
+    checkpoint_format, n_scale_methods, save_all_intermediates :
+        Passed through to :func:`estimate_pipeline_output_size`.
+    force_run : bool
+        If True, hard-fail conditions are downgraded to warnings.
+
+    Raises
+    ------
+    MemoryError
+        When the RAM estimate exceeds 100% of available and
+        ``force_run=False``.
+    OSError
+        When the disk estimate exceeds 100% of free space and
+        ``force_run=False``.
+    """
+    print("\n=== Pre-flight resource check ===")
+
+    # ── RAM ─────────────────────────────────────────────────────────
+    ram_est = estimate_pipeline_memory(
+        sample_dye_pairs, raw_dir=raw_dir, pad=pad, n_workers=n_workers)
+    avail_ram = get_available_memory()
+
+    if ram_est['concurrent_peak_bytes'] is None:
+        print("  RAM: estimate unavailable (tifffile not installed).")
+    elif avail_ram is None:
+        print(f"  RAM: estimated peak "
+              f"{format_bytes(ram_est['concurrent_peak_bytes'])}; "
+              "available unknown (psutil not installed).")
+    else:
+        peak = ram_est['concurrent_peak_bytes']
+        fraction = peak / avail_ram if avail_ram > 0 else float('inf')
+        line = (f"  RAM: estimated peak {format_bytes(peak)} "
+                f"vs {format_bytes(avail_ram)} available "
+                f"({fraction:.0%})")
+        if fraction > HARD_FAIL_FRACTION:
+            print(f"  {line}  ❌ EXCEEDS AVAILABLE")
+            msg = (
+                f"Estimated peak RAM ({format_bytes(peak)}) exceeds "
+                f"available RAM ({format_bytes(avail_ram)}).\n"
+                f"  - {len(sample_dye_pairs)} task(s), {n_workers} concurrent "
+                f"worker(s), pad={pad}.\n"
+                f"  - Per-task peak estimate uses a {PEAK_FACTOR_PER_TASK}x "
+                "factor over single-image float32 size.\n"
+                f"Options:\n"
+                f"  1. Reduce n_workers (currently {n_workers}).\n"
+                f"  2. Reduce pad (currently {pad}; try 1000 or 500).\n"
+                f"  3. Close other applications to free RAM.\n"
+                f"  4. Use parallel='subprocess' mode if leaks are "
+                "suspected.\n"
+                f"  5. Override this check with force_run=True (NOT "
+                "recommended; will likely OOM-kill the kernel).")
+            if force_run:
+                print(f"  (force_run=True; proceeding anyway)")
+            else:
+                raise MemoryError(msg)
+        elif fraction > WARN_FRACTION:
+            print(f"  {line}  ⚠️  HIGH")
+            print(f"  Close other applications if possible. "
+                  "Consider reducing n_workers or pad.")
+        else:
+            print(f"  {line}  ✓")
+
+    for w in ram_est.get('warnings', []):
+        print(f"    [ram warning] {w}")
+
+    # ── Disk ────────────────────────────────────────────────────────
+    disk_est = estimate_pipeline_output_size(
+        sample_dye_pairs, raw_dir=raw_dir, pad=pad,
+        save_all_intermediates=save_all_intermediates,
+        n_scale_methods=n_scale_methods,
+        checkpoint_format=checkpoint_format)
+
+    # Probe the output dir's filesystem; if the dir doesn't exist yet,
+    # walk up to the nearest existing parent (output dirs are
+    # auto-created by the pipeline but might not exist at check time).
+    probe = output_dir
+    while probe and not os.path.exists(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    avail_disk = get_free_disk_space(probe) if probe else None
+
+    total_out = disk_est['total_bytes']
+    if avail_disk is None:
+        print(f"  Disk: estimated total {format_bytes(total_out)}; "
+              "free space unknown.")
+    else:
+        fraction = total_out / avail_disk if avail_disk > 0 else float('inf')
+        line = (f"  Disk: estimated total {format_bytes(total_out)} "
+                f"vs {format_bytes(avail_disk)} free "
+                f"({fraction:.0%})")
+        if fraction > HARD_FAIL_FRACTION:
+            print(f"  {line}  ❌ EXCEEDS FREE SPACE")
+            msg = (
+                f"Estimated output size ({format_bytes(total_out)}) "
+                f"exceeds free disk space ({format_bytes(avail_disk)}) "
+                f"at {probe}.\n"
+                f"  - {disk_est['n_resolvable']} task(s).\n"
+                f"  - checkpoint_format='{checkpoint_format}' "
+                f"(switch to 'tiff' or 'fits' alone to roughly halve).\n"
+                f"Options:\n"
+                f"  1. Free up disk space at {probe}.\n"
+                f"  2. Switch checkpoint_format to 'tiff' or 'fits' "
+                "(not 'both').\n"
+                f"  3. Run a smaller subset of samples/dyes.\n"
+                f"  4. Override this check with force_run=True.")
+            if force_run:
+                print(f"  (force_run=True; proceeding anyway)")
+            else:
+                raise OSError(msg)
+        elif fraction > WARN_FRACTION:
+            print(f"  {line}  ⚠️  HIGH")
+            print("  Consider freeing disk or switching checkpoint_format "
+                  "to one format only.")
+        else:
+            print(f"  {line}  ✓")
+
+    for w in disk_est.get('warnings', []):
+        print(f"    [disk warning] {w}")
+
+    print("=================================\n")
+
+
+# ==============================================================================
+# MEMORY WATCHDOG
+# ==============================================================================
+#
+# Polls available RAM from a background thread. When available RAM falls
+# below a threshold, sets a flag. The pipeline polls this flag at stage
+# boundaries via check_or_raise(); if the flag is set, the run aborts
+# with a clean MemoryError rather than getting SIGKILLed by the OS later.
+#
+# This won't catch every OOM — a single huge allocation can spike between
+# poll intervals and trip the OOM killer immediately — but it should catch
+# the slow swap-filling pattern that's the most common cause of "kernel
+# dies mid-batch" reports.
+# ==============================================================================
+
+
+class MemoryWatchdog:
+    """
+    Background thread that polls available RAM and signals when it falls
+    below a threshold.
+
+    Usage
+    -----
+    >>> from exo2micro.utils import MemoryWatchdog
+    >>> wd = MemoryWatchdog(min_available_gb=0.5)
+    >>> wd.start()
+    >>> try:
+    ...     for sample, dye in tasks:
+    ...         wd.check_or_raise(f"before {sample}/{dye}")
+    ...         SampleDye(sample, dye).run()
+    ... finally:
+    ...     wd.stop()
+
+    The watchdog itself doesn't interrupt anything — it just sets a
+    flag. The caller must poll via :meth:`check_or_raise` at safe
+    abort points (typically stage boundaries) to actually halt.
+
+    Parameters
+    ----------
+    min_available_gb : float
+        Threshold in gibibytes. When ``psutil.virtual_memory().available``
+        drops below this, the watchdog trips. Default 0.5 GB.
+    poll_interval_sec : float
+        How often to poll RAM. Default 5.0 seconds. Polling too fast
+        wastes CPU; too slow misses fast-growing leaks.
+    verbose : bool
+        If True, prints a warning line each time RAM drops below the
+        threshold. Default False (silent until tripped).
+    """
+
+    def __init__(self, min_available_gb=0.5, poll_interval_sec=5.0,
+                 verbose=False):
+        self.min_available_bytes = int(min_available_gb * (1024 ** 3))
+        self.poll_interval_sec = poll_interval_sec
+        self.verbose = verbose
+        self._psutil = _get_psutil()
+        self._thread = None
+        self._stop_event = None
+        self._tripped = False
+        self._tripped_at_bytes = None
+
+        if self._psutil is None:
+            print("[MemoryWatchdog] psutil not installed; watchdog disabled. "
+                  "`pip install psutil` to enable.")
+
+    def start(self):
+        """Start the background polling thread."""
+        if self._psutil is None:
+            return  # silently no-op
+        import threading
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, daemon=True,
+            name='exo2micro-memory-watchdog')
+        self._thread.start()
+
+    def _run(self):
+        while not self._stop_event.is_set():
+            avail = self._psutil.virtual_memory().available
+            if avail < self.min_available_bytes:
+                if not self._tripped:
+                    self._tripped = True
+                    self._tripped_at_bytes = avail
+                    if self.verbose:
+                        print(f"[MemoryWatchdog] tripped: "
+                              f"{avail / 1e9:.2f} GB available "
+                              f"(threshold "
+                              f"{self.min_available_bytes / 1e9:.2f} GB)")
+            self._stop_event.wait(self.poll_interval_sec)
+
+    def stop(self):
+        """Stop the background polling thread."""
+        if self._stop_event is not None:
+            self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        self._thread = None
+        self._stop_event = None
+
+    def is_tripped(self):
+        """Return True if the watchdog has crossed its threshold."""
+        return self._tripped
+
+    def check_or_raise(self, label=''):
+        """
+        Raise :class:`MemoryError` if the watchdog is tripped.
+
+        Call at safe abort points (e.g. between pipeline stages).
+        ``label`` is included in the error message to identify where
+        the abort happened.
+        """
+        if self._tripped:
+            tripped_gb = (self._tripped_at_bytes or 0) / 1e9
+            threshold_gb = self.min_available_bytes / 1e9
+            raise MemoryError(
+                f"MemoryWatchdog triggered abort at '{label}': "
+                f"only {tripped_gb:.2f} GB RAM available "
+                f"(threshold {threshold_gb:.2f} GB). "
+                f"This is a clean abort to avoid the OS OOM-killing the "
+                f"process. To recover: reduce n_workers, reduce pad, or "
+                f"close other applications.")
+
+    def reset(self):
+        """Clear the tripped flag (e.g. after handling a low-RAM event)."""
+        self._tripped = False
+        self._tripped_at_bytes = None

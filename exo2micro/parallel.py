@@ -446,7 +446,8 @@ def run_batch(samples, dyes, parallel=False, n_workers=4,
               params=None, output_dir='processed', raw_dir='raw',
               from_stage=None, to_stage=None, force=False,
               checkpoint_format='tiff', strict_dyes=True,
-              memory_debug=False, timeout_per_task=None):
+              memory_debug=False, timeout_per_task=None,
+              force_run=False):
     """
     High-level batch processing entry point.
 
@@ -537,6 +538,12 @@ def run_batch(samples, dyes, parallel=False, n_workers=4,
         any single task; ``None`` (default) means no timeout.
         Recommended for unattended overnight batches so a wedged
         task doesn't block the whole run.
+    force_run : bool
+        If True, downgrade any hard-fail pre-flight check (RAM or disk
+        estimate exceeds available) to a warning. Default ``False``.
+        Useful when the estimate is known to be conservative or you've
+        already cleared other processes; not recommended otherwise as
+        an OOM kill mid-batch may corrupt checkpoint files.
 
     Returns
     -------
@@ -551,6 +558,12 @@ def run_batch(samples, dyes, parallel=False, n_workers=4,
         OR when the raw directory itself has a fatal layout problem
         (missing, empty, no per-sample subfolders) regardless of
         ``strict_dyes``.
+    MemoryError
+        When the RAM pre-flight estimate exceeds available memory and
+        ``force_run=False``.
+    OSError
+        When the disk pre-flight estimate exceeds free space at
+        ``output_dir`` and ``force_run=False``.
     """
     # Resolve requested pairs against the filesystem.
     discovery = discover_tasks(samples, dyes, raw_dir=raw_dir)
@@ -605,6 +618,35 @@ def run_batch(samples, dyes, parallel=False, n_workers=4,
     tasks = build_task_list(present, params, output_dir, raw_dir,
                             from_stage, to_stage, force,
                             checkpoint_format=checkpoint_format)
+
+    # Pre-flight RAM + disk check. Estimates from raw TIFF headers
+    # what this batch will use, compares to available headroom, and
+    # raises with a useful error if it won't fit (unless force_run).
+    from .utils import preflight_check
+    _params = params or {}
+    pad = _params.get('pad', 2000)
+    save_all_intermediates = _params.get('save_all_intermediates', False)
+    # Count how many scale methods will produce a difference image:
+    # Moffat (always 1) + percentile (if set) + manual (if set).
+    n_scale_methods = 1
+    if _params.get('scale_percentile') is not None:
+        n_scale_methods += 1
+    if _params.get('manual_scale') is not None:
+        n_scale_methods += 1
+    # Concurrent worker count: only the pool mode actually runs n
+    # tasks at once. Serial and subprocess modes are effectively 1.
+    concurrent = n_workers if parallel is True else 1
+    preflight_check(
+        sample_dye_pairs=present,
+        output_dir=output_dir,
+        raw_dir=raw_dir,
+        pad=pad,
+        n_workers=concurrent,
+        checkpoint_format=checkpoint_format,
+        n_scale_methods=n_scale_methods,
+        save_all_intermediates=save_all_intermediates,
+        force_run=force_run,
+    )
 
     # Dispatch by execution mode.
     # `parallel` accepts: False (serial), True (process pool),

@@ -390,7 +390,8 @@ class SampleDye:
                         missing.append((stage, name))
         return missing
 
-    def run(self, from_stage=None, to_stage=None, force=False):
+    def run(self, from_stage=None, to_stage=None, force=False,
+            force_run=False):
         """
         Run the pipeline, resuming from the latest available checkpoint.
 
@@ -409,6 +410,10 @@ class SampleDye:
             Stop after this stage. If None, run to completion.
         force : bool
             If True, re-run all stages even if checkpoints exist.
+        force_run : bool
+            If True, downgrade any hard-fail pre-flight check (RAM or
+            disk estimate exceeds available) to a warning. Default
+            ``False``. See :func:`exo2micro.utils.preflight_check`.
 
         Returns
         -------
@@ -437,6 +442,36 @@ class SampleDye:
         # fires when a specific checkpoint is loaded from the
         # non-preferred format.
         self._preflight_format_check()
+
+        # Pre-flight RAM + disk check for this single task. May raise
+        # MemoryError or OSError; caught by the try/except below and
+        # surfaced as a clean error result rather than a kernel death.
+        try:
+            from .utils import preflight_check
+            n_scale_methods = 1
+            if self._params.get('scale_percentile') is not None:
+                n_scale_methods += 1
+            if self._params.get('manual_scale') is not None:
+                n_scale_methods += 1
+            preflight_check(
+                sample_dye_pairs=[(self.sample, self.dye)],
+                output_dir=self.output_dir,
+                raw_dir=self.raw_dir,
+                pad=self._params.get('pad', 2000),
+                n_workers=1,
+                checkpoint_format=self.checkpoint_format,
+                n_scale_methods=n_scale_methods,
+                save_all_intermediates=self._params.get(
+                    'save_all_intermediates', False),
+                force_run=force_run,
+            )
+        except (MemoryError, OSError) as e:
+            print(f"  !! Pre-flight check failed: {e}")
+            return {
+                'sample': self.sample,
+                'dye': self.dye,
+                'status': f'error: {e}',
+            }
 
         try:
             # Stage 1: Padding
